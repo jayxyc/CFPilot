@@ -700,7 +700,7 @@ cfpilot scan --host &lt;数据面域名&gt; --panel &lt;控制面域名&gt;</pre
         </div>
         <div class="check-group">
           <label class="check-pill"><input type="checkbox" id="cfgVarVlessWs" /> VLESS + WebSocket（全客户端通用）</label>
-          <label class="check-pill"><input type="checkbox" id="cfgVarVlessXhttp" /> VLESS + XHTTP（仅限 Xray 内核）</label>
+<label class="check-pill"><input type="checkbox" id="cfgVarVlessXhttp" /> VLESS + XHTTP（新版 mihomo 1.19+ 支持）</label>
           <label class="check-pill"><input type="checkbox" id="cfgVarTrojan" /> Trojan + WebSocket</label>
         </div>
         <p class="tip">
@@ -789,7 +789,8 @@ cfpilot scan --host &lt;数据面域名&gt; --panel &lt;控制面域名&gt;</pre
         <div class="field">
           <label>固定落地 IP / 固定反代入口</label>
           <textarea id="cfgPinnedHosts" class="mono" rows="3" placeholder="example.com=203.0.113.10&#10;cloudflare.com=r:198.51.100.7"></textarea>
-          <p class="tip">按域名写死落地地址，r: 前缀 = 固定反代入口（Cloudflare 网段站点用）；留空时内核自带 x.com / cloudflare.com 出厂优化，你写的条目按域名合并、同域名以这里为准。</p>
+          <p class="tip">按域名写死落地地址，<code>r:</code> 前缀 = 固定反代入口（只能把 TLS 按 SNI 转给 Cloudflare 承载的域名）。<b>默认不固定任何域名</b>：留空时完全走 DoH 优选与内置反代池。固定入口是单点，失效 IP 现在会熔断（连续失败 2 次进冷却、直接走池，冷却到期自动重试），但每次请求仍可能多等一次短超时，所以只建议在确有实测收益时填。</p>
+          <button class="ghost" type="button" id="btnPinnedSuggest">填入建议值</button>
         </div>
       </div>
 
@@ -863,12 +864,25 @@ cfpilot scan --host &lt;数据面域名&gt; --panel &lt;控制面域名&gt;</pre
       <div class="grid" style="margin-top:12px">
         <div class="field">
           <label>单连接流量上限（MB，0 = 不限制）</label>
-          <input id="cfgDataBudget" type="number" min="0" max="102400" step="1" placeholder="0" />
+          <input id="cfgDataBudget" type="number" min="0" max="102400" step="1" placeholder="512" />
           <p class="tip">
-            单条连接累计传输超过这个值就断开。<b>默认 0 = 不限制</b> ——
-            不限制时，客户端网络很慢的情况下数据会一直堆积在平台缓冲里，
-            极端情况下会触发平台的内存限制（1101）并中断该实例上的其它连接。
-            日常使用建议填 1024（1 GB）；大文件下载场景按需调大。
+            <b>默认 512</b>。单条连接累计传输超过这个值就断开，客户端重连后
+            内核 CPU 从头重新计算。
+            正常浏览网页、看视频基本不受影响（播放器按分片请求，单连接的数据量很小）；
+            <b>下载大文件</b>时单条连接超过上限会断开一次，支持断点续传的客户端
+            （浏览器 / IDM / aria2 等）会自动续上，不确定是否支持续传就调大。
+            多连接下载器（如 aria2 8 线程）是<b>每条连接各自计算</b>，不是整次下载合计。
+            填 0 = 不限制，此时慢速客户端的数据会一直堆积，极端情况下触发内存上限（1101）。
+          </p>
+        </div>
+        <div class="field">
+          <label>无响应换入口上限（1-8，默认 2）</label>
+          <input id="cfgRelayRedial" type="number" min="1" max="8" step="1" placeholder="2" />
+          <p class="tip">
+            直连「能连上但一个字节都收不到」时，最多换几次反代入口重试。
+            每次重试都是一次完整拨号（解析 + 建连竞速），会叠加延迟与 CPU。
+            调大能提高极少数难连目标的成功率，但更慢更费资源；调小更省资源。
+            <b>正常访问不受影响</b>，只在直连假活（连上无数据）时才会用到。
           </p>
         </div>
         <div class="field">
@@ -1261,7 +1275,7 @@ cfpilot scan --host &lt;数据面域名&gt; --panel &lt;控制面域名&gt;</pre
         if (c.subTransport === 'xhttp' || c.subTransport === 'both') legacy.push('vless-xhttp');
       }
       if (c.subProtocol === 'trojan' || c.subProtocol === 'both') legacy.push('trojan');
-      variants = legacy.length ? legacy : ['vless-ws'];
+      variants = legacy.length ? legacy : ['vless-ws','vless-xhttp'];
     }
     $('cfgVarVlessWs').checked = variants.indexOf('vless-ws') >= 0;
     $('cfgVarVlessXhttp').checked = variants.indexOf('vless-xhttp') >= 0;
@@ -1297,6 +1311,7 @@ cfpilot scan --host &lt;数据面域名&gt; --panel &lt;控制面域名&gt;</pre
     $('cfgResolvePreferred').checked = c.resolvePreferred !== false;
     $('cfgAggressiveRedial').checked = !!c.aggressiveRedial;
     $('cfgDataBudget').value = c.dataBudgetMB || 0;
+    $('cfgRelayRedial').value = c.relayRedialMax || 2;
 
     $('poolOfficial').checked = !!c.poolOfficial;
     $('poolDomain').checked = !!c.poolDomain;
@@ -1526,6 +1541,8 @@ cfpilot scan --host &lt;数据面域名&gt; --panel &lt;控制面域名&gt;</pre
       echDns: $('cfgEchDns').value.trim(),
       concurrentDial: $('cfgConcurrent').checked,
       dataBudgetMB: Math.max(0, Number($('cfgDataBudget').value) || 0),
+      // 1-8 与 config-validate 同口径：面板先夹紧，后端再校验一次。
+      relayRedialMax: Math.min(8, Math.max(1, Number($('cfgRelayRedial').value) || 2)),
       enableTrojan: $('cfgEnableTrojan').checked,
       enableXhttp: $('cfgEnableXhttp').checked,
       addApi: $('cfgAddApi').value,
@@ -1552,6 +1569,22 @@ cfpilot scan --host &lt;数据面域名&gt; --panel &lt;控制面域名&gt;</pre
     });
 
     $('btnRefresh').addEventListener('click', function () { loadAll(); toast('状态已刷新'); });
+// 固定入口建议值（**默认不生效**）：与 packages/worker-core/src/config.ts 的
+// SUGGESTED_PINNED_HOSTS 保持一致 —— 改一处必须同步另一处。
+// 只放 CF 承载的域名：pbs.twimg.com 在 Fastly，r: 转发给 CF 不可能生效。
+;(function bindPinnedSuggest() {
+  const btn = $('btnPinnedSuggest');
+  const SUGGESTED_PINNED_HOSTS =
+    '*.x.com=r:155.248.181.189\n*.twitter.com=r:155.248.181.189';
+  if (!btn) return;
+  btn.addEventListener('click', function () {
+    const el = $('cfgPinnedHosts');
+    if (!el) return;
+    el.value = el.value.trim()
+      ? el.value.trim() + '\n' + SUGGESTED_PINNED_HOSTS
+      : SUGGESTED_PINNED_HOSTS;
+  });
+})();
     $('btnLogout').addEventListener('click', function () {
       api('/api/v1/logout', { method: 'POST' }).finally(function () { showLogin(); });
     });

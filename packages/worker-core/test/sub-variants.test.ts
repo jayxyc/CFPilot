@@ -60,7 +60,7 @@ const ctx = (over: Partial<RenderContext> = {}): RenderContext => ({
 })
 
 describe('resolveSubVariants', () => {
-  it('默认只勾 vless-ws', () => {
+  it('显式只传 vless-ws 时只下发 vless-ws', () => {
     expect(resolveSubVariants('vless-ws', config())).toEqual(['vless-ws'])
   })
 
@@ -92,7 +92,7 @@ describe('resolveSubVariants', () => {
   })
 
   it('格式不支持某形态时剔除它', () => {
-    // Clash / sing-box 不支持 XHTTP
+    // sing-box 暂不支持 XHTTP（Clash/mihomo 1.19+ 已支持）
     const got = resolveSubVariants('vless-ws,vless-xhttp', config(), WS_ONLY_VARIANTS)
     expect(got).toEqual(['vless-ws'])
   })
@@ -132,8 +132,17 @@ describe('订阅节点数按形态展开', () => {
     expect(decode(body).some((l) => l.includes('type=xhttp'))).toBe(false)
   })
 
-  it('Clash 格式不含 xhttp 节点（Clash 不支持该传输）', () => {
+  it('Clash 格式：开启 XHTTP 形态时下发 network: xhttp 节点（mihomo 1.19+ 支持）', () => {
     const yaml = renderClash(ctx({ config: config({ subVariants: 'vless-ws,vless-xhttp' }) }))
+    expect(yaml).toContain('network: xhttp')
+    expect(yaml).toContain('xhttp-opts:')
+    expect(yaml).toContain('mode: packet-up')
+    expect(yaml).toContain('no-grpc-header: true')
+    expect(yaml).toContain('alpn: [h2]')
+  })
+
+  it('Clash 格式：XHTTP 入站关闭时不下发 xhttp 节点', () => {
+    const yaml = renderClash(ctx({ config: config({ subVariants: 'vless-ws,vless-xhttp', enableXhttp: false }) }))
     expect(yaml).not.toContain('network: xhttp')
   })
 
@@ -144,9 +153,10 @@ describe('订阅节点数按形态展开', () => {
     expect(json.outbounds.some((o) => o.transport?.type === 'xhttp')).toBe(false)
   })
 
-  it('默认配置下节点数 = 节点池大小（不再乘三）', () => {
-    const body = renderBase64(ctx())
-    expect(decode(body)).toHaveLength(nodes.length)
+  it('默认配置：vless-ws + vless-xhttp 两种形态，节点数 = 节点池 × 2', () => {
+    const cfg = config({ subVariants: 'vless-ws,vless-xhttp' })
+    const body = renderBase64(ctx({ config: cfg }))
+    expect(decode(body)).toHaveLength(nodes.length * 2)
   })
 })
 

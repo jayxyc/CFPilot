@@ -36,12 +36,23 @@ const FAIL_THRESHOLD = 2
 const BASE_COOLDOWN_MS = 30_000
 /** 冷却上限 */
 const MAX_COOLDOWN_MS = 5 * 60_000
+/**
+ * 「不足阈值的失败记录」保留多久（ms）。
+ *
+ * 超过这个时间没有再失败，说明那只是一次偶发抖动，不必继续累计到阈值。
+ * 保留它是有必要的：**第一次失败时 `cooldownUntil` 还是 0**，若按
+ * 「`cooldownUntil <= now` 就删」来清理，第二次失败到来前记录就被删掉，
+ * 计数永远停在 1 —— 阈值 2 永远不会触发，整套健康记忆实际失效。
+ */
+const FAIL_DECAY_MS = 10 * 60_000
 /** 表大小上限：防止长生命周期 isolate 无限累积（§2.2.G 内存纪律） */
 const MAX_ENTRIES = 256
 
 interface HealthState {
   fails: number
   cooldownUntil: number
+  /** 最后一次失败时刻（用于「不足阈值记录」的衰减清理） */
+  lastFailAt: number
 }
 
 const HEALTH = new Map<string, HealthState>()
@@ -57,10 +68,20 @@ export function isEndpointCooled(key: string, now: number): boolean {
   return state !== undefined && state.cooldownUntil > now
 }
 
-/** 清掉过期条目；仍超上限就按插入顺序淘汰最旧的 */
+/**
+ * 清掉过期条目；仍超上限就按插入顺序淘汰最旧的。
+ *
+ * ⚠️ 只清理**两种**条目：
+ *   1. 冷却期已过的（`cooldownUntil > 0 && <= now`）；
+ *   2. 距最后一次失败已超过 `FAIL_DECAY_MS`。
+ * 绝不能在 `cooldownUntil === 0` 时按「<= now」删 —— 那会把「只失败过一次、
+ * 还没到阈值」的记录一起抹掉，阈值永远不会被触发（见 HealthState.lastFailAt）。
+ */
 function prune(now: number): void {
   for (const [key, state] of HEALTH) {
-    if (state.cooldownUntil <= now) HEALTH.delete(key)
+    const cooled = state.cooldownUntil > 0 && state.cooldownUntil <= now
+    const stale = now - state.lastFailAt >= FAIL_DECAY_MS
+    if (cooled || stale) HEALTH.delete(key)
   }
   while (HEALTH.size >= MAX_ENTRIES) {
     const oldest = HEALTH.keys().next().value
@@ -75,8 +96,9 @@ function prune(now: number): void {
 export function recordEndpointFailure(key: string, now: number, targetRejected: boolean): void {
   if (targetRejected) return
   prune(now)
-  const state = HEALTH.get(key) ?? { fails: 0, cooldownUntil: 0 }
+  const state = HEALTH.get(key) ?? { fails: 0, cooldownUntil: 0, lastFailAt: 0 }
   state.fails += 1
+  state.lastFailAt = now
   if (state.fails >= FAIL_THRESHOLD) {
     const over = state.fails - FAIL_THRESHOLD
     state.cooldownUntil = now + Math.min(MAX_COOLDOWN_MS, BASE_COOLDOWN_MS * 2 ** over)
@@ -117,4 +139,79 @@ export function clearEndpointHealth(): void {
 
 export function endpointHealthSize(): number {
   return HEALTH.size
+}
+
+/**
+ * 反代入口的「按域名成功记忆」：hostname → 上次真正成功的入口。
+ *
+ * 放在 endpoint-health 模块里（而不是 dial.ts），让 dial 与 websocket-self
+ * 共享同一份状态，且不污染仅 mock `outbound/dial` 的既有单测。
+ */
+const RELAY_SUCCESS_MEMORY = new Map<string, { ip: string; port: number }>()
+const RELAY_SUCCESS_MEMORY_MAX = 128
+
+/** 从 `ip:port` / `[v6]:port` 形式的 endpoint 里取出入口地址。 */
+export function relayEntryFromEndpoint(endpoint: string): { ip: string; port: number } | undefined {
+  const i = String(endpoint ?? '').lastIndexOf(':')
+  if (i <= 0) return undefined
+  const ip = endpoint.slice(0, i).replace(/^\[/, '').replace(/\]$/, '')
+  const port = Number(endpoint.slice(i + 1))
+  if (!ip || !Number.isFinite(port) || port <= 0) return undefined
+  return { ip, port }
+}
+
+/** 记录某域名的反代成功入口（同时刷新「最近使用」顺序）。 */
+export function rememberRelaySuccess(hostname: string, ip: string, port: number): void {
+  const host = String(hostname ?? '').trim().toLowerCase()
+  if (!host || !ip || !port) return
+  RELAY_SUCCESS_MEMORY.delete(host)
+  RELAY_SUCCESS_MEMORY.set(host, { ip, port })
+  while (RELAY_SUCCESS_MEMORY.size > RELAY_SUCCESS_MEMORY_MAX) {
+    const oldest = RELAY_SUCCESS_MEMORY.keys().next().value
+    if (oldest === undefined) break
+    RELAY_SUCCESS_MEMORY.delete(oldest)
+  }
+}
+
+/** 取某域名的反代成功记忆。 */
+export function relaySuccessFor(hostname: string): { ip: string; port: number } | undefined {
+  const host = String(hostname ?? '').trim().toLowerCase()
+  return host ? RELAY_SUCCESS_MEMORY.get(host) : undefined
+}
+
+/**
+ * 标记某反代入口对指定域名失效（TLS 致命告警 / 零下行假活 / 秒级 EOF）：
+ * 立即清除该域名的成功记忆并记入熔断冷却。
+ */
+export function penalizeRelayEndpoint(
+  hostname: string,
+  endpoint: string,
+  immediateCool = true
+): void {
+  const parsed = relayEntryFromEndpoint(endpoint)
+  if (!parsed) return
+  const host = String(hostname ?? '').trim().toLowerCase()
+  const remembered = host ? RELAY_SUCCESS_MEMORY.get(host) : undefined
+  if (remembered && remembered.ip === parsed.ip && remembered.port === parsed.port) {
+    RELAY_SUCCESS_MEMORY.delete(host)
+  }
+  const key = endpointKey('relay', parsed.ip, parsed.port)
+  const now = Date.now()
+  recordEndpointFailure(key, now, false)
+  if (immediateCool) {
+    recordEndpointFailure(key, now, false)
+  }
+}
+
+/** 在收到有效下行首字节后回写成功记忆并恢复健康。 */
+export function confirmRelaySuccess(hostname: string, endpoint: string): void {
+  const parsed = relayEntryFromEndpoint(endpoint)
+  if (!parsed) return
+  rememberRelaySuccess(hostname, parsed.ip, parsed.port)
+  recordEndpointSuccess(endpointKey('relay', parsed.ip, parsed.port))
+}
+
+/** 清空成功记忆（测试用）。 */
+export function clearRelaySuccessMemory(): void {
+  RELAY_SUCCESS_MEMORY.clear()
 }

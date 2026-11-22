@@ -57,6 +57,9 @@ type App struct {
 	mPortItems []*systray.MenuItem
 	// mCheckAppUpdate 是「检查应用更新」菜单项
 	mCheckAppUpdate *systray.MenuItem
+	// +mesh 专属：组网服务启停 + 节点列表二级菜单（tray_mesh.go 初始化）
+	mMeshToggle *systray.MenuItem
+	mMeshPeers  []*systray.MenuItem
 	// mCheckDeployUpdate 是「检查部署更新」菜单项
 	mCheckDeployUpdate *systray.MenuItem
 	// mQuickScan 是「一键优选 IP」父项。
@@ -101,6 +104,12 @@ type App struct {
 	onOpenUI func(url string)
 	// onExit 回调：退出整个进程
 	onExit func()
+	// quitOnce 保证「退出」只执行一次。
+	//
+	// 用户连点两下退出菜单时，若不做保护会得到两个并发的清理流程
+	// （关窗口 / 停服务 / os.Exit），轻则日志里一堆重复错误，
+	// 重则在 WebView 线程上投递两次 Terminate，行为不可预期。
+	quitOnce sync.Once
 	// onCheckAppUpdate 回调：检查应用更新（由 main 注入）
 	onCheckAppUpdate func()
 	// onCheckDeployUpdate 回调：检查部署更新（由 main 注入）
@@ -162,6 +171,23 @@ func (a *App) SetOpenHandler(fn func(url string)) { a.onOpenUI = fn }
 // SetExitHandler 设置退出实现。
 func (a *App) SetExitHandler(fn func()) { a.onExit = fn }
 
+// quit 处理「退出」菜单点击。
+//
+// ⚠️ 清理动作（关 WebView 窗口 / 停服务）可能要跨线程、等 UI 线程响应，
+// 直接在托盘的 WM_COMMAND 回调里同步做会把托盘消息循环卡住，
+// 用户看到的是「点了退出没反应，界面整个假死」。
+// 这里只发退出信号，真正的清理放到独立 goroutine，
+// 保证托盘回调立刻返回、消息循环能正常处理 systray.Quit() 的 WM_CLOSE。
+// quitOnce 同时挡住连点两下导致的重复清理。
+func (a *App) quit() {
+	a.quitOnce.Do(func() {
+		systray.Quit()
+		if a.onExit != nil {
+			go a.onExit()
+		}
+	})
+}
+
 // SetUpdateChecker 注入后台更新检查器。
 func (a *App) SetUpdateChecker(c *UpdateChecker) {
 	a.checker = c
@@ -186,8 +212,8 @@ func (a *App) refreshUpdateLabels(st *UpdateState) {
 	if st == nil {
 		return
 	}
-	a.mCheckAppUpdate.SetTitle(menuLabel("检查应用更新", st.AppHasUpdate, st.AppLatest))
-	a.mCheckDeployUpdate.SetTitle(menuLabel("检查部署更新", st.DeployHasUpdate, st.DeployLatest))
+	a.mCheckAppUpdate.SetTitle(menuLabel("检查应用更新", st.AppHasUpdate, st.AppLatest, st.AppPrerelease, st.AppPrereleaseLabel))
+	a.mCheckDeployUpdate.SetTitle(menuLabel("检查部署更新", st.DeployHasUpdate, st.DeployLatest, false, ""))
 }
 
 // handleCheckAppUpdate 点击「检查应用更新」。
@@ -289,7 +315,7 @@ func (a *App) onReady() {
 	systray.AddSeparator()
 
 	// ---- 操作区 ----
-	a.mOpen = systray.AddMenuItem("打开业务界面", "打开 CFPilot 的部署 / 优选界面")
+	a.mOpen = systray.AddMenuItem("打开面板", "打开 CFPilot 的部署 / 优选面板")
 	a.mCopy = systray.AddMenuItem("复制服务地址", "把当前地址复制到剪贴板")
 	a.mToggle = systray.AddMenuItem("停止服务", "启动 / 停止本地服务")
 
@@ -365,6 +391,10 @@ func (a *App) onReady() {
 	// ---- 局域网访问（复选菜单项）----
 	a.mLAN = systray.AddMenuItemCheckbox("允许局域网访问", "同一网络的其它设备可访问", false)
 
+	// ---- +mesh 专属菜单：组网服务启停 + 节点列表（二级菜单）----
+	// 普通版为空实现（tray_mesh_stub.go），+mesh 版在 tray_mesh.go 实现。
+	a.addMeshMenu()
+
 	systray.AddSeparator()
 	a.mQuit = systray.AddMenuItem("退出 CFPilot", "停止服务并退出")
 
@@ -409,12 +439,7 @@ func (a *App) onReady() {
 	a.mToggle.Click(func() { a.toggle() })
 	// 局域网访问：切换后重建监听（0.0.0.0 ↔ 127.0.0.1）
 	a.mLAN.Click(func() { a.toggleLAN() })
-	a.mQuit.Click(func() {
-		systray.Quit()
-		if a.onExit != nil {
-			a.onExit()
-		}
-	})
+	a.mQuit.Click(func() { a.quit() })
 }
 
 // switchPort 切换监听端口。

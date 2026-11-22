@@ -117,6 +117,14 @@ describe('配置导出', () => {
     expect(exported.schemaVersion).toBe(1)
   })
 
+  it('资源调优项（流量上限 / 换入口上限）能带出去', () => {
+    // 用户正是为了压 CPU 或恢复大文件下载才调这两项；
+    // 不导出的话换账号导入后会静默回到默认值。
+    const exported = buildConfigExport(baseConfig({ dataBudgetMB: 1024, relayRedialMax: 3 }))
+    expect(exported.config.dataBudgetMB).toBe(1024)
+    expect(exported.config.relayRedialMax).toBe(3)
+  })
+
   it('带口令的落地代理不导出，但会说明原因', () => {
     const exported = buildConfigExport(baseConfig())
     expect(exported.config.socks5).toBeUndefined()
@@ -129,6 +137,29 @@ describe('配置导出', () => {
     const exported = buildConfigExport(baseConfig({ socks5: '1.2.3.4:1080' }))
     expect(exported.config.socks5).toBe('1.2.3.4:1080')
     expect(exported.omitted.find((o) => o.field === 'socks5')).toBeUndefined()
+  })
+
+  it('proxyIp / relayPool 带 userinfo 时同样不导出（校验与脱敏同一口径）', () => {
+    // 这两个字段在白名单里，而 PROXY_LINE 允许 user:pass@ —— 早前只检查
+    // socks5 / httpProxy，配置里写 `socks5://user:pass@host` 就会被原样导出。
+    const exported = buildConfigExport(
+      baseConfig({
+        proxyIp: 'socks5://user:pass@proxy.example:1080',
+        relayPool: 'r1=socks5://user:pass@relay.example:443',
+      })
+    )
+    expect(exported.config.proxyIp).toBeUndefined()
+    expect(exported.config.relayPool).toBeUndefined()
+    expect(exported.omitted.find((o) => o.field === 'proxyIp')?.reason).toContain('口令')
+    expect(exported.omitted.find((o) => o.field === 'relayPool')?.reason).toContain('口令')
+  })
+
+  it('proxyIp / relayPool 不含凭据时照常导出', () => {
+    const exported = buildConfigExport(
+      baseConfig({ proxyIp: 'proxy.example:443', relayPool: 'r1=relay.example:443' })
+    )
+    expect(exported.config.proxyIp).toBe('proxy.example:443')
+    expect(exported.config.relayPool).toBe('r1=relay.example:443')
   })
 })
 

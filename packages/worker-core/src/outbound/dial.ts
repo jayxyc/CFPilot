@@ -38,10 +38,16 @@ import { isIpv4 } from '../protocols/address'
 import { resolveEndpointIps } from './doh'
 import { collectRelayEndpoints, RELAY_BATCH_SIZE, stableRelayIndex, type RelayPoolOptions } from './relay'
 import {
+  clearRelaySuccessMemory,
+  confirmRelaySuccess,
   endpointKey,
   isEndpointCooled,
+  penalizeRelayEndpoint,
   recordEndpointFailure,
   recordEndpointSuccess,
+  relayEntryFromEndpoint,
+  relaySuccessFor,
+  rememberRelaySuccess,
   sortByEndpointHealth,
 } from './endpoint-health'
 import {
@@ -180,6 +186,15 @@ export interface DialOptions {
    */
   budgetMs?: number
   /**
+   * **单次候选尝试**的绝对截止时间（epoch ms，内部使用）。
+   *
+   * 早前每阶段（TCP 建连 / TLS 升级 / 代理握手 / NAT64 重试）各自用同一份
+   * `timeoutMs`，一个候选最坏能吃掉 2~3 倍剩余预算，多候选累加就会超出
+   * `budgetMs`。现在由 `attemptOf` 算出「本次尝试的绝对截止」并贯穿各阶段，
+   * 每阶段的有效超时取 `min(阶段上限, 剩余)`。
+   */
+  deadline?: number
+  /**
    * 收集每次失败的详情（用于诊断）。
    *
    * 旧实现把所有异常吞成 null，导致每一层失败都表现为「目标不可达」，
@@ -202,6 +217,8 @@ export interface DialResult {
   via: 'direct' | 'nat64' | 'socks5' | 'http' | 'https'
   /** 实际连接到的落地地址（代理场景为代理地址） */
   endpoint: string
+  /** 本次连接是否经过第三方反代入口（用于上层识别 TLS 致命告警 / 假活熔断与成功记忆回写） */
+  isRelay?: boolean
   /**
    * 关闭底层 TCP Socket（可读 + 可写一起关）。
    *
@@ -223,6 +240,20 @@ export interface DialResult {
 }
 
 const DEFAULT_TIMEOUT_MS = 8000
+
+/**
+ * 「本次拨号总预算已用尽」——与「候选节点本身不可用」必须分开。
+ *
+ * 竞速里预算耗尽是**我们自己**的决定（或平台侧限制），把它记进端点健康记忆
+ * 会把健康的反代入口 / 优选 IP 误判成宕机并拉入冷却，之后每个请求都少一批候选。
+ * 因此用一个专用错误类型，`attemptOf` 的 catch 识别它后**不记账**。
+ */
+export class DialBudgetError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'DialBudgetError'
+  }
+}
 
 /**
  * 单次拨号的默认总预算（ms）。
@@ -303,7 +334,8 @@ async function connectWithTimeout(
   port: number,
   timeoutMs: number,
   secureTransport?: 'off' | 'on' | 'starttls',
-  expectedServerHostname?: string
+  expectedServerHostname?: string,
+  deadline?: number
 ): Promise<SocketLike> {
   // 惰性加载：模块启动阶段不触碰 sockets，避免 isolate 启动失败（1101）
   const connect = await getConnect()
@@ -317,11 +349,20 @@ async function connectWithTimeout(
       : undefined
   ) as unknown as SocketLike
 
-  /** 单阶段超时（每次等待都重新计时，避免共用一个已被消耗的计时器） */
+  /**
+   * 单阶段超时。
+   *
+   * ⚠️ 每一阶段都要**重新取**「剩余预算」，而不是共用同一个 `timeoutMs`：
+   * `connect()` 与 `startTls()` 各等满一次，一个候选最坏就是 2 倍超时。
+   * 传入 `deadline` 时剩余不足直接抛 `DialBudgetError`（预算耗尽 ≠ 节点坏）。
+   */
   const withTimeout = async <T>(promise: Promise<T>, label: string): Promise<T> => {
+    const remaining =
+      deadline === undefined ? timeoutMs : Math.max(0, Math.min(timeoutMs, deadline - Date.now()))
+    if (remaining <= 0) throw new DialBudgetError(`拨号预算已用尽：${hostname}:${port}`)
     let timer: ReturnType<typeof setTimeout> | undefined
     const timeout = new Promise<never>((_, reject) => {
-      timer = setTimeout(() => reject(new Error(`${label}超时：${hostname}:${port}`)), timeoutMs)
+      timer = setTimeout(() => reject(new Error(`${label}超时：${hostname}:${port}`)), remaining)
     })
     try {
       return await Promise.race([promise, timeout])
@@ -366,8 +407,11 @@ async function connectWithTimeout(
 /** 直连（含 NAT64 兜底） */
 async function dialDirect(options: DialOptions): Promise<DialResult> {
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS
+  // NAT64 兜底与首次尝试共用同一个绝对截止：原实现每次都用满 timeoutMs，
+  // 一次直连最坏能吃掉 2 倍预算（见 DialOptions.deadline 注释）。
+  const deadline = options.deadline
   try {
-    const socket = await connectWithTimeout(options.hostname, options.port, timeoutMs)
+    const socket = await connectWithTimeout(options.hostname, options.port, timeoutMs, undefined, undefined, deadline)
     return {
       readable: socket.readable,
       writable: socket.writable,
@@ -385,7 +429,7 @@ async function dialDirect(options: DialOptions): Promise<DialResult> {
     if (options.nat64 && isIpv4(options.hostname)) {
       const synthesized = nat64Address(options.hostname, options.nat64)
       if (synthesized) {
-        const socket = await connectWithTimeout(synthesized, options.port, timeoutMs)
+        const socket = await connectWithTimeout(synthesized, options.port, timeoutMs, undefined, undefined, deadline)
         return {
           readable: socket.readable,
           writable: socket.writable,
@@ -433,13 +477,22 @@ async function dialViaProxy(
   // ⚠️ 代理握手不能再用固定的 6s：`attemptOf` 已把 timeoutMs 夹到
   // 「本次拨号总预算的剩余时间」，握手若仍各自等满 6s，单候选最坏
   // 5s(connect) + 6s(handshake) = 11s，多候选顺序累加可直接顶穿预算。
-  // 这里让握手超时跟随剩余预算（下限 200ms，绝不移除超时 —— 铁律 15）。
-  const handshakeMs = Math.min(HANDSHAKE_TIMEOUT_MS, Math.max(200, timeoutMs))
+  // 这里让握手超时跟随**本次尝试的绝对截止**（下限 0：已过期就立即失败，
+  // 绝不移除超时 —— 铁律 15）。
+  const budgetLeft = (): number =>
+    options.deadline === undefined ? timeoutMs : options.deadline - Date.now()
 
   // ProxyIP 语义：连到指定地址，但请求的目标仍是原始 hostname:port。
   // 这是同类实现的通用做法，用于让出站流量落在指定的 Cloudflare 网段。
   if (proxy.kind === 'direct') {
-    const socket = await connectWithTimeout(proxy.host, proxy.port, timeoutMs)
+    const socket = await connectWithTimeout(
+      proxy.host,
+      proxy.port,
+      timeoutMs,
+      undefined,
+      undefined,
+      options.deadline
+    )
     return {
       readable: socket.readable,
       writable: socket.writable,
@@ -481,8 +534,22 @@ async function dialViaProxy(
     proxy.port,
     timeoutMs,
     secureTransport,
-    proxy.kind === 'https' ? proxy.serverName : undefined
+    proxy.kind === 'https' ? proxy.serverName : undefined,
+    options.deadline
   )
+  // 握手预算也必须重新取剩余：建连可能已经用掉了大半预算。
+  const handshakeNow = Math.min(
+    HANDSHAKE_TIMEOUT_MS,
+    Math.max(0, Math.min(timeoutMs, budgetLeft()))
+  )
+  if (handshakeNow <= 0) {
+    try {
+      void socket.close()
+    } catch {
+      /* 已关闭 */
+    }
+    throw new DialBudgetError(`拨号预算已用尽：${proxy.host}:${proxy.port}`)
+  }
   try {
     if (proxy.kind === 'http' || proxy.kind === 'https') {
       const readable = await httpConnect(
@@ -491,7 +558,7 @@ async function dialViaProxy(
         options.hostname,
         options.port,
         { username: proxy.username, password: proxy.password },
-        handshakeMs
+        handshakeNow
       )
       return {
         readable,
@@ -510,7 +577,7 @@ async function dialViaProxy(
     const readable = await socks5Connect(socket.readable, socket.writable, options.hostname, options.port, {
       username: proxy.username,
       password: proxy.password,
-      handshakeTimeoutMs: handshakeMs,
+      handshakeTimeoutMs: handshakeNow,
     })
     return {
       readable,
@@ -578,6 +645,24 @@ export const MAX_SIMULTANEOUS_CONNECTS = 6
  * 反代单独压到 2.5s，4 批约 10s，能把全表覆盖完。
  */
 export const RELAY_CONNECT_TIMEOUT_MS = 2500
+
+/**
+ * 「固定反代入口（pin）」的单独连接超时。
+ *
+ * 比常规反代更短：pin 是单点，失效时必须**快速回落**到池，把总预算
+ * （dialBudgetMs 默认 15s）留给后续批次。早前 pin 共用 2.5s，
+ * 配上多条 pin 就能吃掉大半预算，导致兜底池还没被尝试就先超预算。
+ */
+export const PINNED_RELAY_CONNECT_TIMEOUT_MS = 1200
+
+// 成功记忆与惩罚/确认函数收归 endpoint-health.ts，此处重导出保持既有导出契约不变。
+export {
+  clearRelaySuccessMemory,
+  confirmRelaySuccess,
+  penalizeRelayEndpoint,
+  relayEntryFromEndpoint,
+  rememberRelaySuccess,
+}
 
 /**
  * 单条错误信息里最多展开多少条失败原因。
@@ -854,9 +939,15 @@ export async function dial(options: DialOptions): Promise<DialResult> {
   const pinned = options.pinnedIps ?? []
   const pinnedActive = pinned.length > 0
   const optimized = pinnedActive ? [...pinned] : [...(options.optimizedIps ?? [])]
+  // 固定落地 IP 若**全部处于冷却**（连续失败过），说明已知失效：
+  // 此时不能再「只用这批 IP」——否则每次请求都先失败一轮。改为正常做 DoH
+  // 拿真实落点追加在后面（pinned 仍排最前，冷却到期后会自动回到首选）。
+  const pinnedAllCooled =
+    pinnedActive &&
+    pinned.every((p) => isEndpointCooled(endpointKey('direct', p.ip, p.port), Date.now()))
   /** 是否成功解析出目标域名（用于判断「域名直连」是否值得优先） */
   let resolvedTarget = pinnedActive
-  if (options.resolvePreferred && !pinnedActive) {
+  if (options.resolvePreferred && (!pinnedActive || pinnedAllCooled)) {
     try {
       // ⚠️ 两个关键约束（首包延迟治理，见 DOH_FAST_BUDGET_MS 注释）：
       //  1. 独立短预算：超时就放弃解析，直接用域名直连候选，不让整条
@@ -963,15 +1054,23 @@ export async function dial(options: DialOptions): Promise<DialResult> {
     // 总预算约束：剩余时间不足时不再发起连接，超了则截断本次连接超时
     const remaining = deadline - Date.now()
     if (remaining <= 0) {
-      throw new Error(`拨号预算已用尽（${budgetMs}ms）：${options.hostname}:${options.port}`)
+      throw new DialBudgetError(`拨号预算已用尽（${budgetMs}ms）：${options.hostname}:${options.port}`)
     }
     // 反代入口失效时应快速失败，把总预算留给后续批次；只缩短、不放大用户设置。
     const baseTimeout =
       candidate.source === 'relay'
         ? Math.min(options.timeoutMs ?? DEFAULT_TIMEOUT_MS, RELAY_CONNECT_TIMEOUT_MS)
         : options.timeoutMs ?? DEFAULT_TIMEOUT_MS
-    const connectTimeout = Math.max(200, Math.min(baseTimeout, remaining))
-    const attemptOptions: DialOptions = { ...options, timeoutMs: connectTimeout }
+    // 候选级上限（固定 pin 用更短超时）：同样只缩短不放宽。
+    const cappedTimeout = candidate.timeoutMs ? Math.min(baseTimeout, candidate.timeoutMs) : baseTimeout
+    const connectTimeout = Math.max(200, Math.min(cappedTimeout, remaining))
+    // 本次尝试的绝对截止：连接 / TLS / 代理握手 / NAT64 重试共用它，
+    // 避免一个候选把「剩余预算」按阶段重复吃掉（见 DialOptions.deadline）。
+    const attemptOptions: DialOptions = {
+      ...options,
+      timeoutMs: connectTimeout,
+      deadline: Date.now() + connectTimeout,
+    }
     try {
       // IPv6 字面量目标 + 非出站代理候选 → 立刻失败，不发任何 socket。
       //
@@ -1018,11 +1117,16 @@ export async function dial(options: DialOptions): Promise<DialResult> {
       }
       // 直连 / 优选 IP：换入口地址，但目标（TLS SNI 等）仍是原目标
       const result = await dialDirect({ ...attemptOptions, hostname: candidate.host, port: candidate.port })
+      if (candidate.source === 'relay') result.isRelay = true
       recordEndpointSuccess(healthKey)
       return result
     } catch (err) {
-      // 目标站拒绝（TargetRejectedError）说明节点是活的，不计入健康统计
-      recordEndpointFailure(healthKey, Date.now(), err instanceof TargetRejectedError)
+      // 「本次尝试预算耗尽 / 平台并发限制」是我们自己的决定，不是节点故障：
+      // 记进健康记忆会让健康的反代入口 / 优选 IP 被拉入冷却，之后每个请求都少一批候选
+      // （见 DialBudgetError 注释）。其余失败照常记账；目标站拒绝说明节点是活的。
+      if (!(err instanceof DialBudgetError)) {
+        recordEndpointFailure(healthKey, Date.now(), err instanceof TargetRejectedError)
+      }
       const failure = classifyDialFailure(err, candidate.label)
       options.onFailure?.(failure)
       throw err
@@ -1134,12 +1238,19 @@ export async function dial(options: DialOptions): Promise<DialResult> {
    *
    * 命名加 `Group` 后缀是为了不和模块级的 `dialDirect(options)` 撞名 ——
    * 后者是「连到某个 hostname:port」的底层实现。
+   *
+   * ⚠️ 必须先按端点健康做**稳定排序**：`attemptOf` 给所有类型（含 direct /
+   * optimized）都记了成败，但早前这里直接 `directCandidates.map(attemptOf)`，
+   * 冷却中的坏优选 IP 每次仍排在前面，白白抢占「单请求 6 条并发出站」的槽位。
+   * 排序**不删除**任何候选（窗口化 ≠ 截断，§1.31）。
    */
   const dialDirectGroup = async (): Promise<DialResult> => {
-    return await raceDial(
-      directCandidates.map(attemptOf),
-      concurrent
+    const sorted = sortByEndpointHealth(
+      directCandidates,
+      (c) => endpointKey(c.source, c.host, c.port),
+      Date.now()
     )
+    return await raceDial(sorted.map(attemptOf), concurrent)
   }
 
   /**
@@ -1151,15 +1262,25 @@ export async function dial(options: DialOptions): Promise<DialResult> {
   const dialRelay = async (): Promise<DialResult | null> => {
     // 固定反代入口（`域名=r:IP`）优先于一切：用户为该域名实测后写死的入口，
     // 不参与粘性哈希与分批竞速；全部失败才回退到常规反代池。
+    //
+    // ⚠️ pin 必须参与健康记忆（P2 #14 的 endpoint-health）：
+    // 早前这里无条件逐条尝试，坏掉的 pin 会在**每个请求**上白等一次完整反代超时
+    // 且永不冷却 —— 用户侧表现为「app 一直转圈」，即使兜底池其实是好的。
+    // 现在：冷却中直接跳过（用池），冷却到期后自动重试（半开），恢复即回到 pin。
     const pinnedRelays = options.pinnedRelays ?? []
     for (const p of pinnedRelays) {
+      if (isEndpointCooled(endpointKey('relay', p.ip, p.port), Date.now())) continue
       try {
-        return await attemptOf({
+        const res = await attemptOf({
           source: 'relay',
           host: p.ip,
           port: p.port,
           label: `固定反代 ${p.ip}:${p.port}`,
+          timeoutMs: PINNED_RELAY_CONNECT_TIMEOUT_MS,
         })()
+        res.isRelay = true
+        rememberRelaySuccess(options.hostname, p.ip, p.port)
+        return res
       } catch {
         /* 固定入口失败 → 试下一个固定入口，再回退常规池 */
       }
@@ -1170,6 +1291,32 @@ export async function dial(options: DialOptions): Promise<DialResult> {
       restRelay = await collectRelay([], { ...options.relayPool, deadline })
     }
     if (restRelay.length === 0) return null
+
+    // 「上次成功的入口」优先：哈希选路可能为这个域名选到一个对它无效的入口，
+    // 复用真正成功过的那个，升级后就不会「突然打不开」。
+    // 记忆的入口这次失败则走常规选路（health 已记录失败，冷却后自然换一个）。
+    const remembered = relaySuccessFor(options.hostname)
+    if (remembered) {
+      const rememberedKey = endpointKey('relay', remembered.ip, remembered.port)
+      const inPool = restRelay.some(
+        (r) => r.ip === remembered.ip && r.port === remembered.port
+      )
+      if (inPool && !isEndpointCooled(rememberedKey, Date.now())) {
+        try {
+          const res = await attemptOf({
+            source: 'relay',
+            host: remembered.ip,
+            port: remembered.port,
+            label: `反代 ${remembered.ip}:${remembered.port}`,
+          })()
+          res.isRelay = true
+          rememberRelaySuccess(options.hostname, remembered.ip, remembered.port)
+          return res
+        } catch {
+          /* 记忆失效 → 继续常规选路 */
+        }
+      }
+    }
 
     // 粘性首选：同一目标在全球任意 isolate 都落到同一个反代入口，
     // 避免「竞速挑最快」让同一会话的请求从不同出口 IP 出去被目标站风控。
@@ -1187,12 +1334,15 @@ export async function dial(options: DialOptions): Promise<DialResult> {
       if (alt) sticky = alt
     }
     try {
-      return await attemptOf({
+      const res = await attemptOf({
         source: 'relay',
         host: sticky.ip,
         port: sticky.port,
         label: `反代 ${sticky.label}`,
       })()
+      res.isRelay = true
+      rememberRelaySuccess(options.hostname, sticky.ip, sticky.port)
+      return res
     } catch {
       // 兜底列表按健康做**稳定排序**：冷却中的排后，但不删任何候选
       // （窗口化 ≠ 截断，§1.31）。
@@ -1201,7 +1351,13 @@ export async function dial(options: DialOptions): Promise<DialResult> {
         (r) => endpointKey('relay', r.ip, r.port),
         Date.now()
       )
-      return await tryRelayWithWindow(rest, attemptOf, concurrent)
+      const res = await tryRelayWithWindow(rest, attemptOf, concurrent)
+      if (res) {
+        res.isRelay = true
+        const entry = relayEntryFromEndpoint(res.endpoint)
+        if (entry) rememberRelaySuccess(options.hostname, entry.ip, entry.port)
+      }
+      return res
     }
   }
 
@@ -1305,3 +1461,5 @@ export async function dial(options: DialOptions): Promise<DialResult> {
     throw directErr
   }
 }
+
+

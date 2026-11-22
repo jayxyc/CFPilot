@@ -11,6 +11,10 @@ import {
   taskRowHtml,
   taskStatusText,
 } from './task-rows'
+import { MeshTopology, resolveTopoPhase, type TopoNode, type TopoPulse } from './mesh-topology'
+import { edgeInstanceLabel, pickEdgeInstance } from './edge-detect'
+import { createMeshInviteDefaults } from './mesh-invite-defaults'
+import { buildRelayDeployScript, parseRelayInitOutput, randomRelayToken } from './meshRelayDeploy'
 
 (function () {
   'use strict'
@@ -54,14 +58,45 @@ import {
 
   /** 切到「数据源」页时首次自动加载（切回来不重拉，避免冲掉用户勾选）。 */
   let autoLoadSources: (() => void) | null = null
+  /** 切到「组网」页时重算拓扑尺寸（隐藏页画布宽高为 0）。 */
+  let onMeshPageShow: (() => void) | null = null
+  /** 离开组网页时停掉拓扑动画（不可见画布还在跑 rAF 是纯浪费） */
+  let onMeshPageHide: (() => void) | null = null
+
+  /**
+   * 当前构建是否带组网模块（普通版 / +mesh）。
+   *
+   * ⚠️ 必须在发出**任何** `/api/mesh/*` 请求之前确定：
+   * 普通版根本不注册这些路由（见 internal/server/mesh_variant_stub.go），
+   * 无条件轮询会让日志每 2 秒刷一条 404，界面看着也像 +mesh 版。
+   */
+  const meshVariantReady: Promise<boolean> = (async () => {
+    try {
+      return await (window.cfpilot.meshEnabled?.() ?? Promise.resolve(false))
+    } catch {
+      return false
+    }
+  })()
+
+  /** 当前所在的一级页签及各页滚动位置（切页回来保持原位置，避免进度条被滚出视口） */
+  let currentPageName = 'cred'
+  const pageScrollTop: Record<string, number> = {}
 
   function switchPage(name: string): void {
+    const pagesEl = document.getElementById('pages')
+    if (pagesEl && currentPageName) {
+      pageScrollTop[currentPageName] = pagesEl.scrollTop
+    }
+    currentPageName = name
     document.querySelectorAll('#nav button').forEach((b) => {
       b.classList.toggle('active', (b as HTMLElement).dataset.page === name)
     })
     document.querySelectorAll('.page').forEach((p) => {
       p.classList.toggle('active', p.id === 'page-' + name)
     })
+    if (pagesEl) {
+      pagesEl.scrollTop = pageScrollTop[name] ?? 0
+    }
     // 切页时把焦点从输入框移开，避免背景页仍可 Tab 到
     ;(document.activeElement as HTMLElement | null)?.blur()
     // 说明页：自动查一次更新
@@ -76,12 +111,24 @@ import {
     if (name === 'sources' && autoLoadSources) {
       autoLoadSources()
     }
+    // 优选页：切回来时同步进度条状态（并向后端校对后台扫描状态）
+    if (name === 'scan') {
+      syncScanProgressUI()
+      syncRelayProgressUI()
+      void restoreScanProgressFromServer()
+    }
     // 部署页：切进来后重算横向滚动。
     //
     // 为什么必须重算：页面**隐藏时**容器宽度是 0，测不出超出量，
     // 于是滚动没被启用 —— 用户切到这一页看到的仍然是一截被截断的文本。
     if (name === 'deploy') {
       refreshMarquees()
+    }
+    // 组网页：切回时重算拓扑画布尺寸；离开时停动画
+    if (name === 'mesh' && onMeshPageShow) {
+      onMeshPageShow()
+    } else if (name !== 'mesh' && onMeshPageHide) {
+      onMeshPageHide()
     }
   }
 
@@ -260,6 +307,10 @@ import {
 
   /** 当前账号 ID（检测后填充） */
   let currentAccountId = ''
+  /** 账户上下文版本号：切换 / 新建 / 删除账户时递增，用于丢弃在途的旧账号探测结果 */
+  let accountContextGen = 0
+  /** 防止移动端双击「添加并保存」并发创建多份空账户 */
+  let savingToken = false
   /** 当前账号的可读标识（名称 + ID），并入 KV 提示显示 */
   let detectedAccountLabel = ''
   /** KV 选择的引导语（自动选中 / 多实例待选 / 无实例） */
@@ -393,15 +444,18 @@ import {
   }
 
   /** 拉取 KV 列表 */
-  async function loadKvOptions(): Promise<void> {
+  async function loadKvOptions(expectedGen?: number): Promise<void> {
     if (!currentAccountId) {
       log('请先点「检测账号」', 'warn')
       return
     }
+    const targetAccountId = currentAccountId
     log('读取 KV 列表…')
-    const result = await window.cfpilot.listKvOptions(currentAccountId)
+    const result = await window.cfpilot.listKvOptions(targetAccountId)
+    if (expectedGen !== undefined && expectedGen !== accountContextGen) return
     kvOptions = result.options
     const state = await window.cfpilot.credentialsState()
+    if (expectedGen !== undefined && expectedGen !== accountContextGen) return
     renderKvOptions(state.kvNamespaceId || undefined)
     log(`共 ${kvOptions.length} 个命名空间`, 'ok')
   }
@@ -532,6 +586,7 @@ import {
    * 因为写进去的是**当前账户自己的 KV**，内容却是上一个账户的凭据。
    */
   function resetAccountContext(): void {
+    accountContextGen++
     currentAccountId = ''
     detectedAccountLabel = ''
     kvGuidance = ''
@@ -769,10 +824,22 @@ import {
         '运行中 · 端口 ' + st.port + ' · 已运行 ' + fmtUptime(st.uptimeSeconds) + (st.version ? ' · v' + st.version : '')
       // 左上角 logo 下方也标一下版本 —— 用户第一眼就能确认跑的是哪个版本。
       const badge = document.getElementById('appVersion')
+      const meshBuild = st.variant === 'mesh'
       if (badge) {
-        badge.textContent = st.version ? 'v' + st.version : ''
-        badge.title = st.version ? '本程序版本 ' + st.version : ''
+        // 两个产物的版本号完全相同（同一 tag、同一版本源），只在界面上标出变体，
+        // 否则用户拿到 +mesh 安装包和普通 exe 时根本分不清自己开的是哪个。
+        badge.textContent = st.version ? 'v' + st.version + (meshBuild ? ' +mesh' : '') : ''
+        const parts: string[] = []
+        if (st.version) parts.push('本程序版本 ' + st.version + (meshBuild ? '（+mesh 组网版）' : '（普通版）'))
+        if (st.uiBuild) {
+          parts.push('界面构建 ' + st.uiBuild)
+          badge.textContent += ' · ui:' + st.uiBuild
+        }
+        badge.title = parts.join('\n')
       }
+      // 窗口 / 标签页标题：+mesh 版按用户要求显示「CFPilot +mesh」，
+      // 普通版跟随横幅（Linux 原生标题栏与浏览器标签读的就是 document.title）。
+      document.title = meshBuild ? 'CFPilot +mesh' : 'CFPilot 部署与网络维护'
       // 凭据与日志的真实路径。
       //
       // ⚠️ 不能写死：桌面版在用户目录，安卓版在应用私有目录 ——
@@ -860,28 +927,39 @@ import {
     })
 
     document.getElementById('btnProfileDelete')!.addEventListener('click', async () => {
-      const id = $sel('profileSelect').value
-      if (isNewMode()) {
-        log('当前停在「新建账户」，没有可删除的账户', 'warn')
-        return
+      try {
+        const id = $sel('profileSelect').value
+        if (isNewMode()) {
+          log('当前停在「新建账户」，没有可删除的账户', 'warn')
+          return
+        }
+        const target = profiles.find((p) => p.id === id)
+        if (!target) { log('请先选择一个账户', 'warn'); return }
+        if (
+          !confirm(
+            `确定删除本地账户配置「${target.name}」？\n\n` +
+              '只删除本机保存的凭据，不会影响 Cloudflare 上已部署的项目，' +
+              '也不影响订阅地址。'
+          )
+        ) {
+          return
+        }
+        const res = await window.cfpilot.deleteProfile(target.id)
+        if (!res.deleted) { log('删除失败：找不到该配置', 'err'); return }
+        log(`已删除本地账户「${target.name}」`, 'ok')
+        resetAccountContext()
+        await refreshProfiles()
+        await refreshCredState()
+        updateProfileMode()
+        void loadLocalDeployInfo()
+        if (hasActiveToken()) {
+          await detectAccountAndGuide()
+        }
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e)
+        log('删除账户失败：' + msg, 'err')
+        showCredAlert('danger', '删除账户失败：' + escapeHtml(msg))
       }
-      const target = profiles.find((p) => p.id === id)
-      if (!target) { log('请先选择一个账户', 'warn'); return }
-      if (
-        !confirm(
-          `确定删除本地账户配置「${target.name}」？\n\n` +
-            '只删除这台电脑上保存的凭据，不会影响 Cloudflare 上已部署的项目，' +
-            '也不影响订阅地址。'
-        )
-      ) {
-        return
-      }
-      const res = await window.cfpilot.deleteProfile(target.id)
-      if (!res.deleted) { log('删除失败：找不到该配置', 'err'); return }
-      log(`已删除本地账户「${target.name}」`, 'ok')
-      resetAccountContext()
-      await refreshProfiles()
-      await refreshCredState()
     })
 
     document.getElementById('btnSavePanelPw')!.addEventListener('click', async () => {
@@ -938,17 +1016,35 @@ import {
    *   - **1 个实例** → 自动选中并保存（唯一实例不用问，少一步操作）
    *   - **≥2 个实例** → 醒目提示「请在下方选择 KV」（绝不替用户猜）
    */
-  async function detectAccountAndGuide(): Promise<void> {
-    if (!hasActiveToken()) return
+  async function detectAccountAndGuide(targetProfileId?: string): Promise<void> {
+    if (!targetProfileId && !hasActiveToken()) return
+    const myGen = ++accountContextGen
+    const activeBefore = targetProfileId
+      ? profiles.find((p) => p.id === targetProfileId)
+      : profiles.find((p) => p.active)
+    const profileId = targetProfileId || activeBefore?.id || undefined
     clearCredAlert()
     log('检测账号…')
     try {
-      const result = await window.cfpilot.detectAccount()
+      const result = await window.cfpilot.detectAccount(profileId)
+      if (myGen !== accountContextGen) return
+
+      let accountId = result.accountId || ''
+      let accountName = result.accountName || ''
+      if (!accountId && Array.isArray(result.accounts) && result.accounts.length > 0) {
+        accountId = result.accounts[0].id || ''
+        accountName = result.accounts[0].name || ''
+        log(
+          `该 Token 下检测到 ${result.accounts.length} 个账号，已默认选中第一个：${accountName || accountId}`,
+          'warn'
+        )
+      }
+
       // 「目标账号」不再单独占一行：可读标识并入 KV 提示。
-      detectedAccountLabel = result.accountName
-        ? result.accountName + '（' + result.accountId + '）'
-        : result.accountId || ''
-      if (!result.accountId) {
+      detectedAccountLabel = accountName
+        ? accountName + '（' + accountId + '）'
+        : accountId || ''
+      if (!accountId) {
         kvGuidance = '没能读到账号，请检查 Token 权限是否正确。'
         updateKvHint()
         showCredAlert(
@@ -957,26 +1053,31 @@ import {
         )
         return
       }
-      currentAccountId = result.accountId
+      currentAccountId = accountId
 
-      // 把账号名写回当前 profile，下拉框就能显示可读名称
-      const active = profiles.find((p) => p.active)
-      if (active) {
-        await window.cfpilot.updateProfile(active.id, {
-          accountId: result.accountId,
-          accountName: result.accountName,
+      // 把账号名写回目标 profile，下拉框就能显示可读名称
+      const targetId = profileId || profiles.find((p) => p.active)?.id
+      if (targetId) {
+        await window.cfpilot.updateProfile(targetId, {
+          accountId,
+          accountName,
         })
-        await refreshProfiles()
+        if (myGen !== accountContextGen) return
+        await refreshProfiles(targetId)
+        if (myGen !== accountContextGen) return
       }
 
       // 读 KV 列表，并判断有没有已部署的 CFPilot 实例
-      await loadKvOptions()
+      await loadKvOptions(myGen)
+      if (myGen !== accountContextGen) return
       await autoPickKvByInstances()
     } catch (err) {
-      log('检测账号失败：' + (err instanceof Error ? err.message : String(err)), 'err')
-      kvGuidance = '检测失败，请检查网络与 Token。'
+      if (myGen !== accountContextGen) return
+      const msg = err instanceof Error ? err.message : String(err)
+      log('检测账号失败：' + msg, 'err')
+      kvGuidance = '检测失败：' + msg
       updateKvHint()
-      showCredAlert('danger', '检测失败：请检查网络与 Token。')
+      showCredAlert('danger', '检测失败：' + escapeHtml(msg))
     }
   }
 
@@ -1066,6 +1167,12 @@ import {
      * 永远建不出第二个。这也是「新建按钮没反应」背后的真实后果。
      */
     document.getElementById('btnSaveToken')!.addEventListener('click', async () => {
+      if (savingToken) return
+      const saveBtn = document.getElementById('btnSaveToken') as HTMLButtonElement | null
+      const profileSel = $sel('profileSelect')
+      savingToken = true
+      if (saveBtn) saveBtn.disabled = true
+      profileSel.disabled = true
       // ⚠️ 这里必须自己接住异常。
       //
       // 这是个 async 处理函数，抛错时是「未处理的 Promise 拒绝」——
@@ -1082,11 +1189,15 @@ import {
         }
 
         if (isNewMode()) {
-          const created = await window.cfpilot.createProfile()
-          const saved = await window.cfpilot.updateProfile(created.id, { cfToken: token })
-          if (!saved.ok) {
-            log('新建账户失败：' + (saved.error ?? ''), 'err')
-            return
+          // 优先一次原子创建并写入 Token，避免「先建空账户再写 Token」的并发窗口；
+          // 兼容旧版外壳忽略第二参数的情况：若返回 hasToken 为假再补一次 updateProfile。
+          const created = await window.cfpilot.createProfile('', { cfToken: token })
+          if (!created.hasToken) {
+            const saved = await window.cfpilot.updateProfile(created.id, { cfToken: token })
+            if (!saved.ok) {
+              log('新建账户失败：' + (saved.error ?? ''), 'err')
+              return
+            }
           }
           log(`✅ 已新建账户并保存 Token（${created.name}）`, 'ok')
           resetAccountContext()
@@ -1094,8 +1205,8 @@ import {
           // 这里不能再沿用「保持 __new__」的旧规则。
           await refreshProfiles(created.id)
           await refreshCredState()
-          // 新建后自动检测，省得用户再点一次
-          await detectAccountAndGuide()
+          // 新建后自动检测，显式指定刚创建的 profileId，避免与其它在途请求串号
+          await detectAccountAndGuide(created.id)
           return
         }
 
@@ -1112,6 +1223,11 @@ import {
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e)
         log('保存 Token 失败：' + msg, 'err')
+        showCredAlert('danger', '保存 Token 失败：' + escapeHtml(msg))
+      } finally {
+        savingToken = false
+        if (saveBtn) saveBtn.disabled = false
+        profileSel.disabled = false
       }
     })
 
@@ -2219,6 +2335,94 @@ import {
   let scanProgressActive = false
   /** 本次优选已显示过的最大百分比：乱序或无计数的日志不该把进度条拉回去 */
   let scanProgressPct = 0
+  /** 入口优选进度条完整状态（切页、切子页签或刷新后据此恢复显示） */
+  const scanProgressState = {
+    visible: false,
+    pct: 0,
+    stageText: '',
+    text: '',
+  }
+  /** 反代优选进度条完整状态 */
+  const relayProgressState = {
+    visible: false,
+    running: false,
+    pct: 0,
+    text: '',
+  }
+
+  function syncScanProgressUI(): void {
+    const wrap = document.getElementById('scanProgressWrap')
+    const bar = document.getElementById('scanProgressBar')
+    const stageEl = document.getElementById('scanProgressStage')
+    const textEl = document.getElementById('scanProgressText')
+    if (!wrap || !bar) return
+    if (!scanProgressState.visible) {
+      wrap.hidden = true
+      return
+    }
+    wrap.hidden = false
+    bar.style.width = scanProgressState.pct + '%'
+    if (stageEl) stageEl.textContent = scanProgressState.stageText
+    if (textEl) textEl.textContent = scanProgressState.text
+  }
+
+  function syncRelayProgressUI(): void {
+    const wrap = document.getElementById('relayProgressWrap')
+    const bar = document.getElementById('relayBar')
+    const textEl = document.getElementById('relayProgressText')
+    if (!wrap || !bar) return
+    if (!relayProgressState.visible) {
+      wrap.hidden = true
+      return
+    }
+    wrap.hidden = false
+    bar.style.width = relayProgressState.pct + '%'
+    if (textEl) textEl.textContent = relayProgressState.text
+  }
+
+  async function restoreScanProgressFromServer(): Promise<void> {
+    try {
+      const st = await window.cfpilot.scanStatus?.()
+      if (st && (st.running || st.hasState)) {
+        if (st.running) {
+          scanProgressActive = true
+          scanProgressPct = Math.max(scanProgressPct, st.pct || 1)
+          const stage = st.stage || '处理中'
+          scanProgressState.visible = true
+          scanProgressState.pct = scanProgressPct
+          scanProgressState.stageText = `${stage} · 总进度 ${scanProgressPct}%`
+          scanProgressState.text = st.text || stage
+          syncScanProgressUI()
+          if (!uiBusy) setBusy(true)
+          const outEl = document.getElementById('scanOut')
+          if (outEl && (!outEl.textContent || outEl.textContent.includes('暂无结果'))) {
+            outEl.textContent = '正在优选…（下方进度条会实时更新）'
+          }
+        } else if (st.finished && !scanProgressActive && !scanProgressState.visible) {
+          scanProgressPct = st.ok ? 100 : 0
+          scanProgressState.visible = true
+          scanProgressState.pct = scanProgressPct
+          scanProgressState.stageText = st.ok ? '优选完成' : '优选未完成'
+          scanProgressState.text = st.ok ? '已完成' : '未完成'
+          syncScanProgressUI()
+        }
+      }
+    } catch {
+      /* 旧版外壳没有 /api/scan/status 时忽略 */
+    }
+    try {
+      const rst = await window.cfpilot.relayStatus?.()
+      if (rst && (rst.running || (rst.hasState && !relayProgressState.visible))) {
+        relayProgressState.visible = true
+        relayProgressState.running = Boolean(rst.running)
+        relayProgressState.pct = Math.max(0, Math.min(100, rst.pct || 0))
+        relayProgressState.text = rst.text || (rst.running ? '正在体检…' : rst.resultOk ? '已完成' : '未完成')
+        syncRelayProgressUI()
+      }
+    } catch {
+      /* 旧版外壳没有 /api/relay/status 时忽略 */
+    }
+  }
 
   /**
    * 总进度条：贴着结果框下边框，一条贯穿全程。
@@ -2228,11 +2432,6 @@ import {
    */
   function updateScanProgress(message: string): void {
     if (!scanProgressActive) return
-    const wrap = document.getElementById('scanProgressWrap')
-    const bar = document.getElementById('scanProgressBar')
-    const stageEl = document.getElementById('scanProgressStage')
-    const textEl = document.getElementById('scanProgressText')
-    if (!wrap || !bar) return
     const match = /（(\d+)\/(\d+)）/.exec(message)
     // 两轮测速多出「全量粗筛」这一档，插在协议验证与精测之间（45–55%）。
     // 文案含「粗筛」但不带「阶段三 / 测速」，所以必须放在最前面判断。
@@ -2248,26 +2447,23 @@ import {
     // 单调不减：日志到达顺序不严格按阶段，且不少日志没有（n/m）计数，
     // 早前一条「阶段三：…」就能把已经跑到 90% 的条子拉回 57%。
     scanProgressPct = Math.max(scanProgressPct, pct)
-    wrap.hidden = false
-    bar.style.width = scanProgressPct + '%'
-    if (stageEl) stageEl.textContent = `${stage} · 总进度 ${scanProgressPct}%`
+    scanProgressState.visible = true
+    scanProgressState.pct = scanProgressPct
+    scanProgressState.stageText = `${stage} · 总进度 ${scanProgressPct}%`
     // 按钮行只放阶段数字进度，进度条不再挤在这里。
-    if (textEl) textEl.textContent = match ? `${stage} ${match[1]}/${match[2]}` : stage
+    scanProgressState.text = match ? `${stage} ${match[1]}/${match[2]}` : stage
+    syncScanProgressUI()
   }
 
   function finishScanProgress(ok: boolean): void {
     // 收尾即关闭门控：之后取令牌 / 回填 / 部署等日志都不再改动进度条。
     scanProgressActive = false
     scanProgressPct = ok ? 100 : 0
-    const wrap = document.getElementById('scanProgressWrap')
-    const bar = document.getElementById('scanProgressBar')
-    const stageEl = document.getElementById('scanProgressStage')
-    const textEl = document.getElementById('scanProgressText')
-    if (!wrap || !bar) return
-    wrap.hidden = false
-    bar.style.width = ok ? '100%' : '0%'
-    if (stageEl) stageEl.textContent = ok ? '优选完成' : '优选未完成'
-    if (textEl) textEl.textContent = ok ? '已完成' : '未完成'
+    scanProgressState.visible = true
+    scanProgressState.pct = ok ? 100 : 0
+    scanProgressState.stageText = ok ? '优选完成' : '优选未完成'
+    scanProgressState.text = ok ? '已完成' : '未完成'
+    syncScanProgressUI()
   }
 
   /**
@@ -4760,11 +4956,1561 @@ import {
   /* ------------------------------------------------------------------ */
 
   /** 当前选中的优选方向 */
-  let scanTab: 'entry' | 'relay' | 'task' = 'entry'
+  let scanTab: 'entry' | 'relay' | 'mesh' | 'task' = 'entry'
   /** 候选来源：默认（网段采样 / 内置清单）或自定义列表 */
   let sourceMode: 'default' | 'custom' = 'default'
   /** 反代体检「全通可取」的 IP（回填按钮用） */
   let relayPicked: string[] = []
+
+  /** 最近一次盲中继部署结果（供「填入组网配置」跨页回填） */
+  let lastEdgeDeploy: { workerUrl?: string; wssEndpoint?: string; monitorToken?: string } | null = null
+  /** 组网页对端列表（本地编辑，导出配置时用） */
+  let meshPeers: Array<{ nodeId: string; addr: string; staticPub: string; virtualIp: string; name?: string }> = []
+  /** 拓扑动画引擎 */
+  let meshTopo: MeshTopology | null = null
+  /** 组网页当前是否可见：不可见时轮询照常，但不让拓扑引擎跑 rAF */
+  let meshPageActive = false
+  /** 拓扑脉冲与上一次计数（用于把真实流量画成“动起来的点”） */
+  let topoPulses: TopoPulse[] = []
+  let topoLastTx = 0
+  let topoLastRx = 0
+  /** 当前编辑的命名网络档案：create/edit/idle。idle 时配置卡隐藏。 */
+  let meshProfileMode: 'idle' | 'create' | 'edit' = 'idle'
+  let meshProfiles: Record<string, Record<string, unknown>> = {}
+  let meshActiveProfile = ''
+
+  /** 部署页二级页签：代理实例 / 盲中继云监测台 */
+  function bindDeploySubtabs(): void {
+    const nav = document.getElementById('deployTabs')
+    if (!nav) return
+    nav.addEventListener('click', (ev) => {
+      const btn = (ev.target as HTMLElement | null)?.closest(
+        'button[data-deploy-tab]'
+      ) as HTMLButtonElement | null
+      if (!btn) return
+      const next = btn.dataset.deployTab === 'edge' ? 'edge' : 'proxy'
+      for (const b of nav.querySelectorAll('button[data-deploy-tab]')) {
+        b.classList.toggle('active', (b as HTMLElement).dataset.deployTab === next)
+      }
+      const proxy = document.getElementById('proxyPanel')
+      const edge = document.getElementById('edgePanel')
+      if (proxy) proxy.hidden = next !== 'proxy'
+      if (edge) edge.hidden = next !== 'edge'
+      // 切到 edge 时懒加载 zone 列表（只读，不写 KV）
+      if (next === 'edge') void refreshEdgeZones()
+    })
+  }
+
+  async function refreshEdgeZones(): Promise<void> {
+    const sel = document.getElementById('edgeZone') as HTMLSelectElement | null
+    if (!sel) return
+    try {
+      const res = await window.cfpilot.listEdgeZones()
+      const zones = (res && res.zones) || []
+      sel.innerHTML =
+        '<option value="">— 不自动绑定（手动）/ 加载失败 —</option>' +
+        zones.map((z) => `<option value="${z.id}">${z.name}</option>`).join('')
+    } catch {
+      sel.innerHTML = '<option value="">— 域名列表加载失败，可手动绑定 —</option>'
+    }
+  }
+
+  /** 盲中继 / 云监测台部署表单 */
+  function bindEdge(): void {
+    const btn = $('btnEdgeDeploy')
+    if (!btn) return
+    $('btnEdgeRefreshZones')?.addEventListener('click', () => void refreshEdgeZones())
+
+    btn.addEventListener('click', async () => {
+      const domain = ($('edgeDomain')?.value || '').trim()
+      if (!domain) {
+        log('请填写盲中继域名', 'warn')
+        return
+      }
+      btn.setAttribute('disabled', 'true')
+      const out = $('edgeResult')
+      try {
+        const result = await window.cfpilot.deployEdgeRelay({
+          domain,
+          workerName: ($('edgeWorkerName')?.value || '').trim(),
+          dashboardProject: ($('edgeDashboardProject')?.value || '').trim(),
+          monitorPassword: ($('edgePassword')?.value || '').trim(),
+          monitorToken: ($('edgeMonitorToken')?.value || '').trim(),
+          zoneId:
+            ((document.getElementById('edgeZone') as HTMLSelectElement | null)?.value || '') ||
+            ($('edgeZoneId')?.value || '').trim(),
+          autoDns: ($('edgeAutoDns') as HTMLInputElement | null)?.checked !== false,
+          withDashboard: ($('edgeWithDashboard') as HTMLInputElement | null)?.checked !== false,
+          windowMs: ($('edgeWindowMs')?.value || '').trim(),
+          maxBytes: ($('edgeMaxBytes')?.value || '').trim(),
+          maxPackets: ($('edgeMaxPackets')?.value || '').trim(),
+          maxPeers: ($('edgeMaxPeers')?.value || '').trim(),
+        })
+        const text = [
+          `Worker：${result.workerName || ''}`,
+          `监测 API：${result.workerUrl || ''}`,
+          `WSS 端点：${result.wssEndpoint || ''}`,
+          `D1：${result.d1Name || ''} (${result.d1Uuid || ''})`,
+          `监测面板：${result.dashboardUrl || '未部署'}`,
+          `上报令牌：${result.monitorToken || ''}`,
+          `监测台密码：${result.monitorPassword || ''}`,
+        ].join('\n')
+        if (out) { out.textContent = text; out.hidden = false }
+        // 缓存部署结果，解锁「填入组网配置」按钮（跨页回填）
+        lastEdgeDeploy = {
+          workerUrl: result.workerUrl,
+          wssEndpoint: result.wssEndpoint,
+          monitorToken: result.monitorToken,
+        }
+        try {
+          localStorage.setItem('cfpilot-mesh-edge-deploy', JSON.stringify(lastEdgeDeploy))
+        } catch { /* 存储不可用不阻断 */ }
+        const fillBtn = $('btnFillMeshConfig') as HTMLButtonElement | null
+        if (fillBtn) fillBtn.disabled = false
+        log('盲中继 / 云监测台部署完成（结果见下方框，请立即保存令牌与密码）', 'ok')
+      } catch (err) {
+        log('盲中继部署失败：' + (err instanceof Error ? err.message : String(err)), 'err')
+      } finally {
+        btn.removeAttribute('disabled')
+      }
+    })
+
+    /* ---------------- 检测部署状态（只读，绝不部署） ---------------- */
+
+    const detectBtn = document.getElementById('btnEdgeDetect') as HTMLButtonElement | null
+    const detectRow = document.getElementById('edgeDetectRow')
+    const detectSel = document.getElementById('edgeInstancePick') as HTMLSelectElement | null
+    const detectHint = document.getElementById('edgeDetectHint')
+    let detected: CFPilotEdgeRelayInstance[] = []
+
+    /**
+     * 检测结果提示。
+     *
+     * 用 textContent + pre-line 而不是 innerHTML：实例名 / 域名来自云端数据，
+     * 拼 HTML 既多余又给注入留口子。
+     */
+    const setDetectHint = (text: string, level: 'info' | 'ok' | 'warn' | 'err' = 'info'): void => {
+      if (!detectHint) return
+      detectHint.textContent = text
+      detectHint.style.whiteSpace = 'pre-line'
+      detectHint.style.color =
+        level === 'ok' ? 'var(--ok)' : level === 'warn' ? 'var(--warn)' : level === 'err' ? 'var(--err)' : ''
+    }
+
+    /** 把一个实例回填进本页输入框（密码永不回填：只存哈希，读不出来）。 */
+    const applyEdgeInstance = (ins: CFPilotEdgeRelayInstance): void => {
+      const setVal = (id: string, v: string): void => {
+        const el = document.getElementById(id) as HTMLInputElement | null
+        if (el) el.value = v
+      }
+      setVal('edgeDomain', ins.domain || '')
+      setVal('edgeWorkerName', ins.workerName || '')
+      setVal('edgeDashboardProject', ins.dashboardProject || '')
+      if (ins.monitorToken) setVal('edgeMonitorToken', ins.monitorToken)
+      if (ins.limits.windowMs) setVal('edgeWindowMs', ins.limits.windowMs)
+      if (ins.limits.maxBytes) setVal('edgeMaxBytes', ins.limits.maxBytes)
+      if (ins.limits.maxPackets) setVal('edgeMaxPackets', ins.limits.maxPackets)
+      if (ins.limits.maxPeers) setVal('edgeMaxPeers', ins.limits.maxPeers)
+
+      // Zone：下拉里已经有这个 zone 就选中；否则写「手动 Zone ID」，
+      // 不然下拉的 value 设不进去，用户看到的还是「不自动绑定」。
+      const zoneSel = document.getElementById('edgeZone') as HTMLSelectElement | null
+      let zoneApplied = false
+      if (zoneSel && ins.zoneId) {
+        const has = Array.from(zoneSel.options).some((o) => o.value === ins.zoneId)
+        if (has) {
+          zoneSel.value = ins.zoneId
+          zoneApplied = true
+        }
+      }
+      setVal('edgeZoneId', zoneApplied ? '' : ins.zoneId || '')
+
+      const dashSwitch = document.getElementById('edgeWithDashboard') as HTMLInputElement | null
+      if (dashSwitch) dashSwitch.checked = !ins.dashboardReady
+
+      // 与部署成功后的行为对齐：解锁「填入组网配置」并缓存，供组网页一键带入。
+      lastEdgeDeploy = {
+        workerUrl: ins.workerUrl,
+        wssEndpoint: ins.wssEndpoint,
+        monitorToken: ins.monitorToken || '',
+      }
+      try {
+        localStorage.setItem('cfpilot-mesh-edge-deploy', JSON.stringify(lastEdgeDeploy))
+      } catch {
+        /* 存储不可用不阻断 */
+      }
+      const fillBtn = document.getElementById('btnFillMeshConfig') as HTMLButtonElement | null
+      if (fillBtn && ins.wssEndpoint) fillBtn.disabled = false
+
+      const lines: string[] = [
+        `已识别：${ins.workerName}${ins.domain ? ' · ' + ins.domain : ' · 未绑定自定义域名'}`,
+        `监测台：${ins.dashboardReady ? ins.dashboardUrl : '未部署 / 根路径不可用'} · D1：${ins.d1Name || '未找到'}`,
+        `上报令牌：${ins.monitorToken ? '已回填' : '不可读取（见下方提示）'}`,
+        `可达性：${ins.reachable ? '可达' : '本机不可达'} · 监测台密码：${
+          ins.passwordSet ? '已设置' : '未设置或未知'
+        }`,
+      ]
+      if (ins.zoneName) lines.push(`Zone：${ins.zoneName}`)
+      if (ins.warnings.length > 0) {
+        lines.push('提示：' + ins.warnings.join('；'))
+      }
+      lines.push('监测台密码只保存哈希，无法读取；需要重置请在监测台里改密。以上为只读检测，未触发任何部署。')
+      setDetectHint(lines.join('\n'), ins.warnings.length > 0 ? 'warn' : 'ok')
+    }
+
+    detectBtn?.addEventListener('click', async () => {
+      const el = detectBtn as HTMLButtonElement
+      if (typeof window.cfpilot.checkEdgeDeployment !== 'function') {
+        setDetectHint('当前外壳不支持检测部署状态，请用桌面版打开。', 'warn')
+        return
+      }
+      const domain = ($('edgeDomain')?.value || '').trim()
+      const workerName = ($('edgeWorkerName')?.value || '').trim()
+      el.disabled = true
+      setDetectHint('正在检测账号下已部署的盲中继实例（只读）…')
+      try {
+        const res = await window.cfpilot.checkEdgeDeployment!()
+        if (!res || res.ok === false) throw new Error(res?.error || '检测失败')
+        detected = res.instances || []
+        if (detected.length === 0) {
+          if (detectRow) detectRow.style.display = 'none'
+          setDetectHint(
+            '没有检测到盲中继实例：该账号下还没有部署，或 Token 缺少 Workers Scripts / Read 权限。',
+            'warn'
+          )
+          log('盲中继检测：该账号下没有实例', 'warn')
+          return
+        }
+        const picked = pickEdgeInstance(detected, { domain, workerName })
+        if (detectRow && detectSel) {
+          detectSel.innerHTML = detected
+            .map((ins, idx) => `<option value="${idx}">${escapeHtml(edgeInstanceLabel(ins))}</option>`)
+            .join('')
+          const pickedIdx = picked.instance ? detected.indexOf(picked.instance) : 0
+          detectSel.value = String(pickedIdx >= 0 ? pickedIdx : 0)
+          // 只有一个实例时不显示选择器（少一个无意义的控件）
+          detectRow.style.display = detected.length > 1 ? 'flex' : 'none'
+          detectSel.onchange = () => {
+            const idx = Number(detectSel.value)
+            const target = detected[Number.isFinite(idx) ? idx : 0]
+            if (target) applyEdgeInstance(target)
+          }
+        }
+        if (picked.instance) applyEdgeInstance(picked.instance)
+        if (res.deployInProgress) {
+          log('提示：检测时正好有部署在进行，结果可能稍旧', 'warn')
+        }
+        const accountNotes = (res.warnings || []).join('；')
+        if (accountNotes) log('盲中继检测提示：' + accountNotes, 'warn')
+        if (picked.ambiguous) {
+          log('检测到多个盲中继实例，已按第一个回填；可在下方下拉框切换', 'warn')
+        }
+        log(`盲中继检测完成：识别到 ${detected.length} 个实例`, 'ok')
+      } catch (err) {
+        setDetectHint('检测失败：' + (err instanceof Error ? err.message : String(err)), 'err')
+        log('盲中继检测失败：' + (err instanceof Error ? err.message : String(err)), 'err')
+      } finally {
+        el.disabled = false
+      }
+    })
+  }
+
+  /** 组网页：拓扑动画 + 配置管理 + 从部署结果回填。 */
+  function bindMesh(): void {
+    const canvas = document.getElementById('topoCanvas') as HTMLCanvasElement | null
+    if (canvas) {
+      try {
+        meshTopo = new MeshTopology(canvas)
+        // 先放一个本地节点占位：up=false（还没启动），引擎会画空态雷达场景。
+        const selfId = ($('meshNodeId')?.value || '').trim() || 'local'
+        const nodes: TopoNode[] = [{
+          id: selfId, label: '本机',
+          vip: ($('meshVirtualIp')?.value || '').trim(),
+          connType: 'self', up: false,
+        }]
+        meshTopo.setData(nodes, [], { running: false, autoStart: false })
+        // 空态浮层改由 engine 的 phase 驱动（未启动 / 等待对端 / 有对端），
+        // 不再在这里硬隐藏 —— 以前提前 display:none 正是「一片空白」的成因之一。
+        onMeshPageShow = () => {
+          meshPageActive = true
+          meshTopo?.refresh()
+          meshTopo?.start()
+          void refreshRelayIpPick()
+        }
+        onMeshPageHide = () => {
+          meshPageActive = false
+          meshTopo?.stop()
+        }
+
+        // 空态浮层的两个快捷入口：启动组网直接复用配置卡的主按钮；
+        // 「去填配置」滚到组网配置卡（不复制任何启动逻辑）。
+        document.getElementById('btnTopoStart')?.addEventListener('click', () => {
+          const startBtn = document.getElementById('btnMeshStart') as HTMLButtonElement | null
+          if (startBtn && !startBtn.disabled) startBtn.click()
+        })
+        document.getElementById('btnTopoConfig')?.addEventListener('click', () => {
+          const edit = document.getElementById('btnMeshProfileEdit') as HTMLButtonElement | null
+          const create = document.getElementById('btnMeshProfileCreate') as HTMLButtonElement | null
+          if (meshActiveProfile && edit && !edit.disabled) edit.click()
+          else if (create) create.click()
+        })
+        document.getElementById('topoBadge')?.addEventListener('click', (event) => {
+          event.stopPropagation()
+          const list = document.getElementById('topoIpList')
+          if (list) list.hidden = !list.hidden
+        })
+        document.addEventListener('click', (event) => {
+          const list = document.getElementById('topoIpList')
+          const badge = document.getElementById('topoBadge')
+          if (!list || !badge || list.hidden) return
+          const target = event.target as Node | null
+          if (target && !list.contains(target) && !badge.contains(target)) list.hidden = true
+        })
+      } catch (err) {
+        log('拓扑动画初始化失败：' + (err instanceof Error ? err.message : String(err)), 'warn')
+      }
+    }
+
+    // 自动加载本机身份（NodeId / 隧道公钥由本地密钥派生，用户无需填写）
+    void (async () => {
+      // 普通版没有 /api/mesh/identity：跳过，避免启动时刷一条 404。
+      if (!(await meshVariantReady)) return
+      try {
+        // 把已保存的对端 ID 带上，服务端检测到 ID 冲突（克隆密钥）会自动重生本机身份
+        const peerIds = meshPeers.map(p => p.nodeId).filter(Boolean).join(',')
+        const resp = await fetch('/api/mesh/identity' + (peerIds ? '?peerIds=' + encodeURIComponent(peerIds) : ''))
+        const data = await resp.json().catch(() => ({}))
+        if (resp.ok && data.nodeId) {
+          const el = $('meshNodeId')
+          if (el) el.value = data.nodeId
+          localStorage.setItem('cfpilot-mesh-node-id', data.nodeId)
+          if (data.tunnelPub) localStorage.setItem('cfpilot-mesh-tunnel-pub', data.tunnelPub)
+          if (data.tunnelPrivate) localStorage.setItem('cfpilot-mesh-tunnel-priv', data.tunnelPrivate) // base64，直接对接 Go []byte
+          if (data.identitySeed) localStorage.setItem('cfpilot-mesh-identity-seed', data.identitySeed)
+        }
+      } catch { /* 身份加载失败不阻断其它配置 */ }
+    })()
+
+    // 生成邀请链接：把本机网络参数 + 本机作为一个 peer 编码进链接
+    $('btnMeshMakeInvite')?.addEventListener('click', async () => {
+      const ttlH = ($('meshInviteTtl')?.value || '').trim()
+      const ttl = ttlH ? Number(ttlH) * 3600 : 0
+      let defaults: ReturnType<typeof createMeshInviteDefaults>
+      try {
+        defaults = createMeshInviteDefaults({
+          networkName: ($('meshNetwork')?.value || '').trim(),
+          psk: ($('meshPsk')?.value || '').trim(),
+          virtualIp: ($('meshVirtualIp')?.value || '').trim(),
+        })
+      } catch (err) {
+        log(err instanceof Error ? err.message : String(err), 'warn')
+        return
+      }
+      const setInput = (id: string, value: string): void => {
+        const input = $(id)
+        if (input) input.value = value
+      }
+      setInput('meshNetwork', defaults.networkName)
+      setInput('meshPsk', defaults.psk)
+      setInput('meshVirtualIp', defaults.virtualIp)
+      let nodeId = ($('meshNodeId')?.value || '').trim()
+      let tunnelPub = localStorage.getItem('cfpilot-mesh-tunnel-pub') || ''
+      if (!nodeId || !tunnelPub) {
+        try {
+          const identityResp = await fetch('/api/mesh/identity')
+          const identity = await identityResp.json().catch(() => ({}))
+          if (!identityResp.ok || !identity.nodeId || !identity.tunnelPub) {
+            throw new Error(identity.error || `HTTP ${identityResp.status}`)
+          }
+          nodeId = identity.nodeId
+          tunnelPub = identity.tunnelPub
+          setInput('meshNodeId', nodeId)
+          localStorage.setItem('cfpilot-mesh-node-id', nodeId)
+          localStorage.setItem('cfpilot-mesh-tunnel-pub', tunnelPub)
+          if (identity.tunnelPrivate) localStorage.setItem('cfpilot-mesh-tunnel-priv', identity.tunnelPrivate)
+          if (identity.identitySeed) localStorage.setItem('cfpilot-mesh-identity-seed', identity.identitySeed)
+        } catch (err) {
+          log('读取本机组网身份失败：' + (err instanceof Error ? err.message : String(err)), 'err')
+          return
+        }
+      }
+      autoSaveMesh()
+      const payload = {
+        network: defaults.networkName,
+        psk: defaults.psk,
+        addr: ($('meshListen')?.value || '').trim() || '0.0.0.0:51820',
+        node_id: nodeId,
+        tunnel_pub: tunnelPub,
+        virtual_ip: defaults.virtualIp,
+        suggested: defaults.suggestedIp,
+        // 把本机的云监测配置一起带上：被邀请方入网后自动上报，无需手抄
+        monitoring_endpoint: ($('meshMonitorEndpoint')?.value || '').trim(),
+        monitoring_token: ($('meshMonitorToken')?.value || '').trim(),
+        monitoring_interval_ms: Math.max(5, Number($('meshMonitorInterval')?.value || 30)) * 1000,
+        alias: ($('meshMonitorAlias')?.value || '').trim(),
+        monitor_alias: ($('meshMonitorAlias')?.value || '').trim(),
+        // 盲中继配置：跨 NAT 必需，随链接带给 B
+        relay_domain: ($('meshRelayDomain')?.value || '').trim(),
+        relay_room: '',
+        relay_connect_ip: ($('meshRelayConnectIp')?.value || '').trim(),
+      }
+      try {
+        const resp = await fetch('/api/mesh/invite/build?ttl=' + ttl, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          credentials: 'same-origin', body: JSON.stringify(payload),
+        })
+        const data = await resp.json().catch(() => ({}))
+        if (resp.ok && data.uri) {
+          const out = document.getElementById('meshInviteOut') as HTMLTextAreaElement | null
+          if (out) out.value = data.uri
+          // 邀请链接含 PSK/令牌，刷新后不该重新生成；落盘方便 B 端重试。
+          try { localStorage.setItem('cfpilot-mesh-invite', data.uri) } catch { /* 忽略 */ }
+          log('邀请链接已生成（注意：含明文 PSK，勿公开分享）', 'ok')
+        } else {
+          log('生成邀请链接失败：' + (data.error || `HTTP ${resp.status}`), 'err')
+        }
+      } catch (err) {
+        log('生成邀请链接失败：' + (err instanceof Error ? err.message : String(err)), 'err')
+      }
+    })
+
+
+    // 填入组网配置（来自盲中继部署结果）
+    $('btnFillMeshConfig')?.addEventListener('click', () => {
+      if (!lastEdgeDeploy) {
+        log('请先部署盲中继，再填入组网配置', 'warn')
+        return
+      }
+      const url = (lastEdgeDeploy.wssEndpoint || lastEdgeDeploy.workerUrl || '').trim()
+      // wss://<domain>/mesh/<hash>?peer_id=... → 只提取盲中继域名；房间由后端派生。
+      try {
+        const u = new URL(url.replace(/^wss:/, 'https:'))
+        const domain = u.hostname
+        if (domain) { const el = $('meshRelayDomain'); if (el) el.value = domain }
+        const pw = lastEdgeDeploy.monitorToken
+        // 云监测台上报：部署结果里就有 Worker 地址与 MONITOR_TOKEN，直接回填
+        if (lastEdgeDeploy.workerUrl) {
+          const el = $('meshMonitorEndpoint'); if (el && !el.value) el.value = lastEdgeDeploy.workerUrl
+        }
+        if (pw) { const el = $('meshMonitorToken'); if (el && !el.value) el.value = pw }
+        log(`已填入盲中继域名：${domain}；房间由网络名与 PSK 自动确定`, 'ok')
+      } catch {
+        log('解析 WSS 地址失败，请手动填写', 'warn')
+      }
+    })
+
+    // 添加对端
+    $('btnAddPeer')?.addEventListener('click', () => {
+      const nodeId = ($('peerNodeId')?.value || '').trim()
+      const addr = ($('peerAddr')?.value || '').trim()
+      const pub = ($('peerPub')?.value || '').trim()
+      const vip = ($('peerVip')?.value || '').trim()
+      if (!nodeId || !addr || pub.length !== 64) {
+        log('对端需填写 ID、地址与 64 hex 静态公钥', 'warn')
+        return
+      }
+      // 网段校验：TUN 固定配 /24，且不会给对端加 /32 主机路由 ——
+      // 两端虚拟 IP 不在同一个 /24 时，内核不会把包送进隧道（默认经真实网卡出去），
+      // 表现为「握手成功但互 ping 不通」。这里只提示，不阻止（同机双节点+手工路由是例外）。
+      const selfVip = ($('meshVirtualIp')?.value || '').trim()
+      const subnetOf = (s: string): string | null => {
+        const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(s)
+        if (!m) return null
+        const heads = [Number(m[1]), Number(m[2]), Number(m[3])]
+        if (heads.some((n) => n > 255) || Number(m[4]) > 255) return null
+        return heads.join('.')
+      }
+      const selfSubnet = subnetOf(selfVip)
+      const peerSubnet = subnetOf(vip)
+      if (selfSubnet && peerSubnet && selfSubnet !== peerSubnet) {
+        log(
+          `⚠ 对端虚拟 IP 与本节点不在同一 /24 网段（本机 ${selfSubnet}.x，对端 ${peerSubnet}.x）：` +
+            '两端默认无法互通，请改成同一网段、只改最后一段',
+          'warn'
+        )
+      }
+      // 字段名对齐 Go 的 mesh.PeerConfig（JSON 解码按字段名匹配）
+      meshPeers.push({ nodeId, addr, staticPub: pub, virtualIp: vip })
+      renderMeshPeers()
+      $('peerNodeId')!.value = ''; $('peerAddr')!.value = ''; $('peerPub')!.value = ''; $('peerVip')!.value = ''
+      log('已添加对端', 'ok')
+    })
+
+    // 保存配置到本地（localStorage）
+    // 组网按钮状态机：
+    //   - 启停进行中（in-flight）：主按钮禁用并显示「处理中…」，防止连点导致重启；
+    //   - 已运行：「启动组网」→「重启组网」，用户一眼看出已经起来了，
+    //     想重启是明确的第二次动作，不再是「以为没启动成功」的误触；
+    //   - 未运行：恢复「启动组网」，停止按钮禁用。
+    let meshRunning = false
+    let meshBusy = false
+    const applyMeshButtons = (): void => {
+      const start = $('btnMeshStart') as HTMLButtonElement | null
+      const stop = $('btnMeshStop') as HTMLButtonElement | null
+      if (start) {
+        start.textContent = meshBusy ? '处理中…' : meshRunning ? '重启组网' : '启动组网'
+        start.disabled = meshBusy
+      }
+      if (stop) stop.disabled = meshBusy || !meshRunning
+    }
+
+    $('btnMeshReset')?.addEventListener('click', async () => {
+      if (!window.confirm('停止组网并清空当前表单？已保存的网络档案不会被删除。')) return
+      meshBusy = true
+      applyMeshButtons()
+      try {
+        const resp = await fetch('/api/mesh/stop', { method: 'POST', credentials: 'same-origin' })
+        if (!resp.ok) log('停止组网服务失败，仍会清空本机配置：HTTP ' + resp.status, 'warn')
+      } catch (err) {
+        log('停止组网服务失败，仍会清空本机配置：' + (err instanceof Error ? err.message : String(err)), 'warn')
+      } finally {
+        meshRunning = false
+        meshBusy = false
+        applyMeshButtons()
+      }
+      const form = $('meshContent') as HTMLDivElement | null
+      form?.querySelectorAll<HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement>('input,textarea,select').forEach((el) => {
+        if (el instanceof HTMLInputElement && el.type === 'checkbox') el.checked = el.id === 'meshEnableDegrade' || el.id === 'meshEnablePunch'
+        else el.value = ''
+      })
+      meshPeers = []
+      renderMeshPeers()
+      localStorage.removeItem('cfpilot-mesh-config')
+      localStorage.removeItem('cfpilot-mesh-invite')
+      meshTopo?.setData([], [], { running: false, autoStart: meshPageActive })
+      void refreshMeshStatus()
+      log('已停止组网并清空当前表单；已保存的网络档案仍可在“当前网络”里选择。', 'ok')
+    })
+
+    $('btnMeshSave')?.addEventListener('click', async () => {
+      if (meshProfileMode !== 'idle') {
+        const name = ($('meshProfileName')?.value || '').trim()
+        if (!name) {
+          log('请先填写“网络配置名称”，或点击“取消创建”返回当前网络。', 'warn')
+          return
+        }
+      }
+      const cfg = collectMeshConfig()
+      try {
+        localStorage.setItem('cfpilot-mesh-config', JSON.stringify({ ...cfg, peers: meshPeers }))
+        if (meshProfileMode !== 'idle') {
+          const name = ($('meshProfileName')?.value || '').trim()
+          if (!name) { log('请先填写配置名称', 'warn'); return }
+          meshProfiles[name] = { ...cfg, peers: meshPeers }
+          meshActiveProfile = name
+          persistMeshProfiles()
+          if (await meshVariantReady) {
+            try {
+              await fetch('/api/mesh/profiles', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' }, credentials: 'same-origin',
+                body: JSON.stringify({ action: 'save', name, config: cfg }),
+              })
+            } catch { /* 服务未启动时仅存本地 */ }
+          }
+        }
+        log('组网配置已保存到当前网络', 'ok')
+      } catch {
+        log('保存失败（浏览器存储不可用）', 'warn')
+      }
+    })
+
+    // 启动组网：把配置直接交给提权服务（无需命令行/JSON 文件）
+    $('btnMeshStart')?.addEventListener('click', async () => {
+      // 创建/修改状态下必须有档案名；绝不静默退回“默认网络”，否则会覆盖别的用户配置。
+      if (meshProfileMode !== 'idle') {
+        const name = ($('meshProfileName')?.value || '').trim()
+        if (!name) {
+          log('请先填写“网络配置名称”，或点击“取消创建”返回当前网络。', 'warn')
+          return
+        }
+      }
+      // 若粘贴了邀请链接：先解析并自动填入网络参数 + 把发起方加为对端（一次点击完成入网）
+      const inviteUri = ($('meshInviteInput')?.value || '').trim()
+      if (inviteUri) {
+        try {
+          const ir = await fetch('/api/mesh/invite/parse', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            credentials: 'same-origin', body: JSON.stringify({ uri: inviteUri }),
+          })
+          const id = await ir.json().catch(() => ({}))
+          if (!ir.ok) { log('邀请链接解析失败：' + (id.error || `HTTP ${ir.status}`), 'err'); return }
+          const put = (elId: string, v: string) => { const el = $(elId); if (el && v) el.value = v }
+          put('meshNetwork', id.network || '')
+          put('meshPsk', id.psk || '')
+          // 监测配置随邀请链接带入（B 无需再手抄地址/令牌）
+          put('meshMonitorEndpoint', id.monitoringEndpoint || '')
+          put('meshMonitorToken', id.monitoringToken || '')
+          if (id.monitoringIntervalMs) {
+            const el = $('meshMonitorInterval'); if (el) el.value = String(Math.max(5, Math.round(Number(id.monitoringIntervalMs) / 1000)))
+          }
+          // 监测台 alias 是发起方设备名，只用于对端显示名，不写回本机设备名。
+          put('meshRelayDomain', id.relayDomain || '')
+          put('meshRelayConnectIp', id.relayConnectIp || '')
+          // 邀请里的建议虚拟 IP 是权威值：即使本机残留旧值，也必须以建议网段为准。
+          if (id.suggestedIp) put('meshVirtualIp', id.suggestedIp)
+          // 新邀请代表新的权威对端：替换历史对端，避免旧虚拟 IP / 旧公钥残留。
+          if (id.peerNodeId) {
+            meshPeers = [{ nodeId: id.peerNodeId, addr: id.peerAddr || '', staticPub: id.peerPub || '', virtualIp: id.peerVip || '', name: id.peerName || undefined }]
+            renderMeshPeers()
+          }
+          autoSaveMesh()
+          log('已从邀请链接填入配置并添加对端，正在启动组网…', 'ok')
+        } catch (err) {
+          log('邀请链接处理失败：' + (err instanceof Error ? err.message : String(err)), 'err')
+          return
+        }
+      }
+      const cfg = collectMeshConfig()
+      log(`启动参数：本机虚拟IP=${cfg.virtualIp || '(空)'}，对端=${(cfg.peers as Array<{ virtualIp?: string }> || []).map(p => p.virtualIp || '(空)').join(',') || '无'}`, 'ok')
+      meshBusy = true
+      applyMeshButtons()
+      try {
+        // 启动前刷新身份：带对端 ID 检测冲突（克隆密钥导致 ID 相同时自动重生），
+        // 并用最新身份覆盖配置（NodeId / 隧道私钥）
+        const peerIds = (cfg.peers as Array<{ nodeId?: string }> || []).map(p => p.nodeId || '').filter(Boolean).join(',')
+        const idResp = await fetch('/api/mesh/identity' + (peerIds ? '?peerIds=' + encodeURIComponent(peerIds) : ''))
+        if (idResp.ok) {
+          const idData = await idResp.json().catch(() => ({}))
+          if (idData.nodeId) { cfg.nodeId = idData.nodeId; const el = $('meshNodeId'); if (el) el.value = idData.nodeId }
+          if (idData.tunnelPrivate) { cfg.tunnelPrivate = idData.tunnelPrivate; localStorage.setItem('cfpilot-mesh-tunnel-priv', idData.tunnelPrivate) }
+          if (idData.identitySeed) { cfg.identitySeed = idData.identitySeed; localStorage.setItem('cfpilot-mesh-identity-seed', idData.identitySeed) }
+        }
+        const resp = await fetch('/api/mesh/start', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          credentials: 'same-origin',
+          body: JSON.stringify(cfg),
+        })
+        const data = await resp.json().catch(() => ({}))
+        if (resp.ok && data.ok !== false) {
+          log('组网已启动（提权服务已创建虚拟网卡）', 'ok')
+          meshRunning = true
+          // 启动成功后自动保存为当前网络，并收起配置卡。
+          const profileName = (meshProfileMode === 'idle'
+            ? meshActiveProfile
+            : ($('meshProfileName')?.value || '').trim())
+          if (!profileName) {
+            log('组网已启动，但当前没有网络配置名称，本次未保存档案；请先创建网络并填写名称。', 'warn')
+            return
+          }
+          const finalCfg = collectMeshConfig()
+          meshProfiles[profileName] = { ...finalCfg, peers: meshPeers }
+          meshActiveProfile = profileName
+          persistMeshProfiles()
+          hideMeshConfig()
+          if (await meshVariantReady) {
+            try {
+              await fetch('/api/mesh/profiles', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' }, credentials: 'same-origin',
+                body: JSON.stringify({ action: 'save', name: profileName, config: finalCfg }),
+              })
+            } catch { /* 服务未启动时已存本地，下次连接可重试 */ }
+          }
+        } else {
+          let msg = data.error || data.message || `HTTP ${resp.status}`
+          // 旧版 meshd 的典型特征：JSON 解码 NodeID 失败。
+          // 这几乎总是「服务跑的是旧二进制」（升级时服务没被替换），给出可执行的修复步骤。
+          if (/cannot unmarshal string into Go struct field Config\.nodeId/.test(String(msg))) {
+            msg +=
+              '\n【诊断】组网服务仍是旧版本，安装包升级没有生效。' +
+              '请以管理员身份执行：net stop CFPilotMesh  →  sc delete CFPilotMesh  →  重新运行安装程序。'
+          }
+          log('启动失败：' + msg, 'err')
+        }
+      } catch (err) {
+        log('启动失败：' + (err instanceof Error ? err.message : String(err)), 'err')
+      } finally {
+        meshBusy = false
+        applyMeshButtons()
+      }
+    })
+
+    // 停止组网
+    $('btnMeshStop')?.addEventListener('click', async () => {
+      meshBusy = true
+      applyMeshButtons()
+      try {
+        const resp = await fetch('/api/mesh/stop', {
+          method: 'POST', credentials: 'same-origin',
+        })
+        if (resp.ok) {
+          log('组网已停止', 'ok')
+          meshRunning = false
+        } else {
+          const data = await resp.json().catch(() => ({}))
+          log('停止失败：' + (data.error || `HTTP ${resp.status}`), 'err')
+        }
+      } catch (err) {
+        log('停止失败：' + (err instanceof Error ? err.message : String(err)), 'err')
+      } finally {
+        meshBusy = false
+        applyMeshButtons()
+      }
+    })
+
+    // ---- 组网入口优选（盲中继专用探测）----
+    //
+    // 与「入口优选」共用一套探测原语，但目标是盲中继域名 + Worker 房间路径，
+    // 判据是「能否 101」+ 握手 RTT。结果只用于组网的 WSS 入口，不进订阅。
+    type MeshScanRow = {
+      ip: string
+      port: number
+      ok: boolean
+      latencyMs: number
+      colo?: string
+      status?: number
+      attempts: number
+      successes: number
+      error?: string
+    }
+    let meshScanRows: MeshScanRow[] = []
+    let meshScanBusy = false
+
+    const meshScanKey = (r: MeshScanRow): string => (r.port === 443 ? r.ip : `${r.ip}:${r.port}`)
+
+    const renderMeshScanTable = (): void => {
+      const table = document.getElementById('meshScanTable') as HTMLTableElement | null
+      const body = document.getElementById('meshScanBody')
+      if (!table || !body) return
+      body.textContent = ''
+      if (meshScanRows.length === 0) {
+        table.hidden = true
+        return
+      }
+      table.hidden = false
+      meshScanRows.forEach((r, i) => {
+        const tr = document.createElement('tr')
+        const cells = [
+          String(i + 1),
+          meshScanKey(r),
+          r.colo || '—',
+          r.ok ? String(r.latencyMs) : '—',
+          `${r.successes}/${r.attempts}`,
+          r.ok ? '可用' : r.status ? `HTTP ${r.status}` : r.error || '失败',
+        ]
+        cells.forEach((text, idx) => {
+          const td = document.createElement('td')
+          td.textContent = text
+          if (idx === 5 && !r.ok) td.style.color = 'var(--muted)'
+          tr.append(td)
+        })
+        body.append(tr)
+      })
+      const best = meshScanRows.find((r) => r.ok)
+      const apply = document.getElementById('btnMeshScanApply') as HTMLButtonElement | null
+      if (apply) {
+        apply.disabled = !best
+        apply.dataset.ip = best ? meshScanKey(best) : ''
+      }
+    }
+
+    const runMeshScan = async (): Promise<void> => {
+      if (meshScanBusy) return
+      const domain = ($('meshScanDomain')?.value || '').trim()
+      const status = document.getElementById('meshScanStatus')
+      if (!domain) {
+        log('请先填写盲中继域名', 'warn')
+        return
+      }
+      const network = ($('meshNetwork')?.value || '').trim()
+      const psk = ($('meshPsk')?.value || '').trim()
+      if (!network || !psk) {
+        log('请先生成邀请链接，或填写网络名与网络密钥', 'warn')
+        return
+      }
+      const rawCandidates =
+        (document.getElementById('meshScanCandidates') as HTMLTextAreaElement | null)?.value || ''
+      const candidates = rawCandidates
+        .split('\n')
+        .map((l) => l.trim())
+        .filter(Boolean)
+      const btn = document.getElementById('btnMeshScanRun') as HTMLButtonElement | null
+      meshScanBusy = true
+      if (btn) {
+        btn.disabled = true
+        btn.textContent = '探测中…'
+      }
+      if (status) status.textContent = '正在探测盲中继 WebSocket 连通性，请稍候…'
+      try {
+        const resp = await fetch('/api/mesh/relay-scan', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          credentials: 'same-origin',
+          body: JSON.stringify({
+            candidates,
+            relayDomain: domain,
+            room: '',
+            network,
+            psk,
+            attempts: Number($('meshScanAttempts')?.value || 1),
+            maxCandidates: Number($('meshScanMax')?.value || 20),
+            timeoutMs: Number($('meshScanTimeout')?.value || 6000),
+          }),
+        })
+        const data = await resp.json().catch(() => ({}))
+        if (!resp.ok || data.ok === false) {
+          const msg = String(data.error || `HTTP ${resp.status}`)
+          if (status) status.textContent = '探测失败：' + msg
+          log('组网入口探测失败：' + msg, 'err')
+          return
+        }
+        meshScanRows = (data.results || []) as MeshScanRow[]
+        renderMeshScanTable()
+        const summary = `可用 ${data.usable} / ${data.total}，耗时 ${Math.round(Number(data.elapsedMs) || 0)}ms`
+        if (status) status.textContent = summary
+        log('组网入口探测完成：' + summary, 'ok')
+        try {
+          localStorage.setItem(
+            'cfpilot-mesh-entry-scan',
+            JSON.stringify({ at: Date.now(), domain, rows: meshScanRows })
+          )
+        } catch {
+          /* 存储不可用不阻断 */
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err)
+        if (status) status.textContent = '探测失败：' + msg
+        log('组网入口探测失败：' + msg, 'err')
+      } finally {
+        meshScanBusy = false
+        if (btn) {
+          btn.disabled = false
+          btn.textContent = '开始探测'
+        }
+      }
+    }
+
+    document.getElementById('btnMeshScanRun')?.addEventListener('click', () => {
+      void runMeshScan()
+    })
+
+    document.getElementById('btnMeshScanFillFromConfig')?.addEventListener('click', () => {
+      const d = ($('meshRelayDomain')?.value || '').trim()
+      const de = $('meshScanDomain')
+      if (de && d) de.value = d
+      if (!d) log('组网页还没填盲中继域名', 'warn')
+      else log('已从组网配置读取盲中继域名', 'ok')
+    })
+
+    // 内置候选源：拉回来只是候选，仍须探测 101 才算可用。
+    const loadMeshEntrySources = async (): Promise<void> => {
+      const sel = $('meshScanSource') as unknown as HTMLSelectElement | null
+      if (!sel) return
+      // 普通版没有 /api/mesh/entry-sources：跳过，避免启动时刷一条 404。
+      if (!(await meshVariantReady)) return
+      try {
+        const resp = await fetch('/api/mesh/entry-sources', { credentials: 'same-origin' })
+        const data = await resp.json().catch(() => ({}))
+        const list = (data.sources || []) as Array<{
+          id: string
+          name: string
+          region?: string
+        }>
+        for (const src of list) {
+          const opt = document.createElement('option')
+          opt.value = src.id
+          opt.textContent = src.region ? `${src.name}（${src.region}）` : src.name
+          sel.append(opt)
+        }
+      } catch {
+        /* 端点不可用时不阻断手动输入 */
+      }
+    }
+
+    document.getElementById('btnMeshScanFetchSource')?.addEventListener('click', async () => {
+      const sel = $('meshScanSource') as unknown as HTMLSelectElement | null
+      const sourceId = sel?.value || ''
+      if (!sourceId) {
+        log('请先选择内置候选源', 'warn')
+        return
+      }
+      const status = document.getElementById('meshScanStatus')
+      if (status) status.textContent = '正在拉取候选清单…'
+      try {
+        const resp = await fetch('/api/mesh/entry-fetch', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          credentials: 'same-origin',
+          body: JSON.stringify({ sourceId }),
+        })
+        const data = await resp.json().catch(() => ({}))
+        if (!resp.ok || data.ok === false) {
+          const msg = String(data.error || `HTTP ${resp.status}`)
+          if (status) status.textContent = '拉取失败：' + msg
+          log('拉取候选清单失败：' + msg, 'err')
+          return
+        }
+        const area = document.getElementById('meshScanCandidates') as HTMLTextAreaElement | null
+        if (area) area.value = String(data.text || '')
+        if (status) {
+          status.textContent = `已拉取 ${data.count} 个候选（第三方清单，须实测 101 才算可用）`
+        }
+        log(`已拉取 ${data.count} 个候选到候选框`, 'ok')
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err)
+        if (status) status.textContent = '拉取失败：' + msg
+        log('拉取候选清单失败：' + msg, 'err')
+      }
+    })
+
+    document.getElementById('btnMeshScanImport')?.addEventListener('click', () => {
+      ;(document.getElementById('meshScanFile') as HTMLInputElement | null)?.click()
+    })
+
+    document.getElementById('meshScanFile')?.addEventListener('change', () => {
+      const input = document.getElementById('meshScanFile') as HTMLInputElement | null
+      const file = input?.files?.[0]
+      if (!file) return
+      const reader = new FileReader()
+      reader.onload = () => {
+        const area = document.getElementById('meshScanCandidates') as HTMLTextAreaElement | null
+        if (area) area.value = String(reader.result || '')
+        log(`已导入文件：${file.name}`, 'ok')
+        if (input) input.value = ''
+      }
+      reader.readAsText(file)
+    })
+
+    void loadMeshEntrySources()
+
+    document.getElementById('btnMeshScanApply')?.addEventListener('click', () => {
+      const btn = document.getElementById('btnMeshScanApply') as HTMLButtonElement | null
+      const ip = btn?.dataset.ip || ''
+      if (!ip) return
+      const el = $('meshRelayConnectIp')
+      if (el) el.value = ip
+      const sel = $('meshRelayIpPick') as unknown as HTMLSelectElement | null
+      if (sel) sel.value = ip
+      log('已填入组网配置的 WSS 入口 IP：' + ip, 'ok')
+    })
+
+    // 恢复上次探测结果；没有历史时用当前组网配置预填目标，省一次手动输入
+    try {
+      const rawScan = localStorage.getItem('cfpilot-mesh-entry-scan')
+      if (rawScan) {
+        const saved = JSON.parse(rawScan) as { domain?: string; rows?: MeshScanRow[] }
+        const de = $('meshScanDomain')
+        if (de && saved.domain) de.value = saved.domain
+        meshScanRows = Array.isArray(saved.rows) ? saved.rows : []
+        renderMeshScanTable()
+      } else {
+        const de = $('meshScanDomain')
+        const d = ($('meshRelayDomain')?.value || '').trim()
+        if (de && d) de.value = d
+      }
+    } catch {
+      /* 忽略损坏的本地结果 */
+    }
+
+    /**
+     * 用现有优选结果填充「WSS 入口 IP」下拉。
+     *
+     * 不重新造一个 IP 优选：直接复用
+     *   - 入口优选：本机扫描历史里最近的 CF 边缘 IP（直连、延迟最低）
+     *   - 反代优选：本次会话反代体检的入选项（第三方入口，能绕过域名/IP 被阻断）
+     * 两者的 IP 都可以作为 TCP 目标，TLS SNI/Host 仍是盲中继域名。
+     */
+    async function refreshRelayIpPick(): Promise<void> {
+      // $() 的返回类型是 HTMLInputElement，这里实际是 <select>，需要经 unknown 断言
+      const sel = $('meshRelayIpPick') as unknown as HTMLSelectElement | null
+      const inp = $('meshRelayConnectIp')
+      if (!sel) return
+      const keep = sel.value
+      sel.innerHTML = '<option value="">— 手动输入 / 留空按域名解析 —</option>'
+      const add = (ip: string, group: string, note: string): void => {
+        if (!ip) return
+        const opt = document.createElement('option')
+        opt.value = ip
+        opt.textContent = group + ' · ' + ip + (note ? '（' + note + '）' : '')
+        sel.append(opt)
+      }
+      // 组网入口探测结果优先：这是唯一对盲中继口径真实的数据（真的打房间路径 + 101 + RTT）
+      for (const r of meshScanRows.filter((x) => x.ok).slice(0, 20)) {
+        add(meshScanKey(r), '组网入口', [r.colo, `${r.latencyMs}ms`].filter(Boolean).join(' '))
+      }
+      try {
+        const res = await window.cfpilot.getScanHistory()
+        const sessions = (res && res.sessions) || []
+        const latest = sessions[0]
+        if (latest) {
+          const seen = new Set<string>()
+          for (const e of latest.entries.slice(0, 30)) {
+            if (!e.ip || seen.has(e.ip)) continue
+            seen.add(e.ip)
+            const where = e.colo || e.city || ''
+            const ms = Math.round(Number(e.latency) || 0)
+            add(e.ip, '通用入口', [where, ms ? ms + 'ms' : '', '非盲中继实测'].filter(Boolean).join(' '))
+          }
+        }
+      } catch {
+        /* 历史不可用不阻断选择器 */
+      }
+      for (const ip of relayPicked.slice(0, 20)) add(ip, '反代优选', '')
+      if (keep) sel.value = keep
+      sel.onchange = () => {
+        if (inp) inp.value = sel.value
+      }
+    }
+
+    // ---- 组网状态（真实数据，每 2 秒刷新）----
+    // 早前界面完全没有轮询：启动后用户只能看着拓扑动画干等，
+    // 也分不清「已握手 / 握手中 / 对端根本不可达」。
+    type MeshStatus = {
+      running?: boolean
+      nodeId?: string
+      virtualIp?: string
+      listen?: string
+      uptimeSec?: number
+      natType?: string
+      reflexive?: string
+      handshakeOk?: number
+      txFrames?: number
+      rxFrames?: number
+      txDropped?: number
+      rxDropped?: number
+      note?: string
+      peers?: Array<{
+        nodeId: string
+        virtualIp?: string
+        addr?: string
+        state?: string
+        via?: string
+        rttMs?: number
+        lossRate?: number
+        online?: boolean
+        name?: string
+        punchState?: string
+        punchKind?: string
+      }>
+    }
+    const shortId = (s: string): string => (!s ? '—' : s.length > 8 ? s.slice(0, 8) : s)
+    const readableName = (name: string | undefined, fallback: string): string => {
+      const raw = (name || '').trim()
+      if (!raw) return fallback
+      const printable = [...raw].filter((ch) => {
+        const code = ch.codePointAt(0) ?? 0
+        return code >= 32 && code !== 127 && (code >= 0x20 && code <= 0x7e || code >= 0x80)
+      }).join('').trim()
+      return printable || fallback
+    }
+    const put = (id: string, text: string): void => {
+      const el = document.getElementById(id)
+      if (el) el.textContent = text
+    }
+    const fmtDur = (sec: number): string => {
+      if (!sec || sec < 1) return '—'
+      const h = Math.floor(sec / 3600)
+      const m = Math.floor((sec % 3600) / 60)
+      const s = sec % 60
+      return h > 0 ? `${h}h${m}m` : m > 0 ? `${m}m${s}s` : `${s}s`
+    }
+    const refreshMeshStatus = async (): Promise<void> => {
+      let data: MeshStatus
+      try {
+        const resp = await fetch('/api/mesh/status', { credentials: 'same-origin' })
+        if (!resp.ok) return
+        data = (await resp.json()) as MeshStatus
+      } catch {
+        return
+      }
+      const running = !!data.running
+      // 运行状态 pill：文案 + 配色（运行中绿色，未运行中性）
+      const runPill = document.getElementById('meshStatRunning')
+      if (runPill) {
+        runPill.textContent = running ? '运行中' : '未运行'
+        runPill.className = 'topo-pill' + (running ? ' ok' : '')
+      }
+      // 以服务端状态为准同步按钮（启停进行中时不动，避免闪烁）。
+      meshRunning = running
+      if (!meshBusy) applyMeshButtons()
+      put('meshStatFrames', `${data.txFrames || 0} / ${data.rxFrames || 0}`)
+      put('meshStatDrop', `${data.txDropped || 0} / ${data.rxDropped || 0}`)
+      put('meshStatNat', data.natType || '—')
+      put('meshStatReflex', data.reflexive || '—')
+      const v6El = $('topoIpv6')
+      if (v6El) v6El.textContent = (data as MeshStatus & { reflexive6?: string }).reflexive6 || '—'
+      put('meshStatNote', data.note || (running ? '运行中：等待对端或已在线' : ''))
+
+      const peers = data.peers || []
+      const phase = resolveTopoPhase(running, peers.length)
+
+      // ---- 先画拓扑：即使 0 个对端也要画（本机 + 空态雷达动画）。
+      // 旧实现在「没有对端」时提前 return，连 setData 都跳过了 —— 画布自然一片空白。
+      const nodes: TopoNode[] = [{
+        id: data.nodeId || 'local',
+        label: '本机' + (data.virtualIp ? ` ${data.virtualIp}` : ''),
+        vip: data.virtualIp || '',
+        connType: 'self',
+        up: running,
+      }]
+      for (const p of peers) {
+        nodes.push({
+          id: p.nodeId,
+          label: readableName(p.name, p.virtualIp || shortId(p.nodeId)),
+          vip: p.virtualIp || shortId(p.nodeId),
+          connType: (p.via === 'wss' || p.via === 'relay') ? 'relay' : 'p2p',
+          up: !!p.online,
+          rttMs: p.online ? (p.rttMs || null) : null,
+          lossPct: p.online ? Math.round((p.lossRate || 0) * 100) : null,
+          punchState: p.punchState,
+          punchKind: p.punchKind,
+        })
+      }
+      const nowMs = performance.now()
+      const tx = data.txFrames || 0
+      const rx = data.rxFrames || 0
+      if (running && (tx > topoLastTx || rx > topoLastRx)) {
+        for (const p of peers) {
+          if (!p.online) continue
+          topoPulses.push({ id: `${nowMs}-${p.nodeId}`, to: p.nodeId, kind: 'traffic', bornAt: nowMs })
+        }
+      }
+      topoLastTx = Math.max(topoLastTx, tx)
+      topoLastRx = Math.max(topoLastRx, rx)
+      topoPulses = topoPulses.filter((x) => nowMs - x.bornAt < 2000).slice(-60)
+      meshTopo?.setData(nodes, topoPulses, { running, autoStart: meshPageActive })
+
+      // ---- 空态浮层：未启动 / 等待对端两套文案；有对端时整块淡出 ----
+      const emptyEl = document.getElementById('topoEmpty')
+      if (emptyEl) {
+        emptyEl.classList.toggle('hide', phase === 'active')
+        if (phase !== 'active') {
+          const title = document.getElementById('topoEmptyTitle')
+          const text = document.getElementById('topoEmptyText')
+          if (title) title.textContent = running ? '等待对端连接…' : '组网未启动'
+          if (text) {
+            text.textContent = running
+              ? '已启动但还没有对端：确认两端使用同一邀请链接，并检查盲中继域名与网络密钥。'
+              : '填好下方「组网配置」后点「启动组网」，这里会实时画出节点与链路。'
+          }
+        }
+      }
+      const topoBadge = document.getElementById('topoBadge')
+      const onlineList = document.getElementById('topoIpList')
+      if (topoBadge) {
+        const onlinePeers = peers.filter((p) => p.online).length
+        const online = running ? onlinePeers + 1 : 0
+        topoBadge.textContent =
+          phase === 'active' ? `${online} 台在线` : running ? '扫描中…' : '待启动'
+        if (onlineList) {
+          onlineList.textContent = ''
+          if (running) {
+            const rows: Array<{ name: string; vip: string }> = [
+              { name: '本机', vip: data.virtualIp || '—' },
+              ...peers.filter((p) => p.online).map((p) => ({ name: readableName(p.name, shortId(p.nodeId)), vip: p.virtualIp || '—' })),
+            ]
+            for (const row of rows) {
+              const item = document.createElement('div')
+              item.className = 'topo-ip-row'
+              item.title = `点击复制 ${row.vip}`
+              const name = document.createElement('span')
+              name.className = 'name'
+              name.textContent = row.name
+              const ip = document.createElement('span')
+              ip.textContent = row.vip
+              item.append(name, ip)
+              item.addEventListener('click', () => copy(row.vip))
+              onlineList.append(item)
+            }
+          }
+        }
+      }
+      const peerBadge = document.getElementById('meshPeerBadge')
+      if (peerBadge) peerBadge.textContent = `${peers.length} 个对端`
+
+      // ---- 节点列表（只放对端；为空时给一行可操作的提示） ----
+      const tbody = document.getElementById('meshLivePeers')
+      if (!tbody) return
+      tbody.textContent = ''
+      if (peers.length === 0) {
+        const tr = document.createElement('tr')
+        const td = document.createElement('td')
+        td.colSpan = 6
+        td.className = 'topo-peer-empty'
+        td.textContent = '还没有对端节点 —— 在下方「组网配置」添加对端，或粘贴邀请链接后启动组网。'
+        tr.append(td)
+        tbody.append(tr)
+        return
+      }
+      for (const p of peers) {
+        const tr = document.createElement('tr')
+        const punchLabel = (): string => {
+          if (p.punchState === 'direct') return '直连已建立'
+          if (p.punchState === 'probing' || p.punchState === 'retrying') {
+            return `打洞中${p.punchKind ? '·' + p.punchKind : ''}`
+          }
+          if (p.punchState === 'failed') return '打洞失败（中继保持）'
+          return p.state || (p.online ? '已连接' : '等待对端')
+        }
+        const cells = [
+          readableName(p.name, shortId(p.nodeId)),
+          p.virtualIp || '—',
+          p.via || '—',
+          punchLabel(),
+          p.rttMs ? `${p.rttMs} ms` : '—',
+          `${Math.round((p.lossRate || 0) * 100)}%`,
+        ]
+        cells.forEach((c, index) => {
+          const td = document.createElement('td')
+          if (index === 1 && p.virtualIp) {
+            const link = document.createElement('span')
+            link.className = 'copy-ip'
+            link.textContent = c
+            link.title = '点击复制虚拟 IP'
+            link.addEventListener('click', () => copy(p.virtualIp || ''))
+            td.append(link)
+          } else {
+            td.textContent = c
+          }
+          tr.append(td)
+        })
+        if (p.online || p.state === '已连接') tr.style.color = '#22c55e'
+        tbody.append(tr)
+      }
+    }
+    // 只在 +mesh 版轮询：普通版每 2 秒一条 404 会把日志页刷满。
+    void meshVariantReady.then((meshOn) => {
+      if (!meshOn) {
+        // 普通版：组网页整块隐藏，拓扑动画没必要空转（也不该假装自己"在扫描"）。
+        meshTopo?.stop()
+        return
+      }
+      window.setInterval(() => {
+        void refreshMeshStatus()
+      }, 2000)
+      void refreshMeshStatus()
+    })
+
+    // 恢复本地配置（显式键→元素映射，不能靠「mesh+首字母大写」猜）
+    // 旧实现对 networkName / virtualIp 等拼出 meshNetworkName 这种不存在的 id，
+    // 结果刷新后大部分字段恢复不了；且只有点过「保存配置」才有内容，用户没点就全丢。
+    const MESH_FIELD_IDS: Record<string, string> = {
+      networkName: 'meshNetwork', psk: 'meshPsk', virtualIp: 'meshVirtualIp',
+      listen: 'meshListen', tunName: 'meshTunName',
+      relayDomain: 'meshRelayDomain',
+      relayConnectIp: 'meshRelayConnectIp',
+      enableDegrade: 'meshEnableDegrade', disablePunch: 'meshEnablePunch',
+      monitorEndpoint: 'meshMonitorEndpoint', monitorToken: 'meshMonitorToken',
+      relayServerId: 'meshRelayServerId', relayServerAddr: 'meshRelayServerAddr',
+      relayServerToken: 'meshRelayServerToken', relayServerMode: 'meshRelayServerMode',
+      monitorInterval: 'meshMonitorInterval', monitorAlias: 'meshMonitorAlias',
+      inviteUri: 'meshInviteInput',
+    }
+    const applyMeshSaved = (saved: Record<string, unknown>): void => {
+      for (const [k, v] of Object.entries(saved)) {
+        const id = MESH_FIELD_IDS[k]
+        if (!id || typeof v !== 'string' && typeof v !== 'boolean') continue
+        const el = document.getElementById(id)
+        if (!el) continue
+        if (el instanceof HTMLInputElement && el.type === 'checkbox') el.checked = v === true
+        else (el as HTMLInputElement | HTMLTextAreaElement).value = String(v)
+      }
+      // 恢复对端列表（独立于表单字段）
+      if (Array.isArray(saved.peers)) {
+        meshPeers = (saved.peers as typeof meshPeers).filter((p) => p && typeof p.nodeId === 'string')
+        renderMeshPeers()
+      }
+    }
+    try {
+      const saved = localStorage.getItem('cfpilot-mesh-config')
+      if (saved) applyMeshSaved(JSON.parse(saved) as Record<string, unknown>)
+      const savedProfiles = localStorage.getItem('cfpilot-mesh-profiles')
+      if (savedProfiles) {
+        const parsed = JSON.parse(savedProfiles) as Record<string, Record<string, unknown>>
+        if (parsed && typeof parsed === 'object') meshProfiles = parsed
+      }
+      meshActiveProfile = localStorage.getItem('cfpilot-mesh-active-profile') || ''
+      // 升级兼容：老用户只有单份配置，自动迁移成「默认网络」。
+      if (Object.keys(meshProfiles).length === 0 && saved) {
+        meshProfiles['默认网络'] = JSON.parse(saved) as Record<string, unknown>
+        meshActiveProfile = '默认网络'
+      }
+      const edge = localStorage.getItem('cfpilot-mesh-edge-deploy')
+      if (edge) lastEdgeDeploy = JSON.parse(edge) as typeof lastEdgeDeploy
+      const invite = localStorage.getItem('cfpilot-mesh-invite')
+      if (invite) {
+        const inviteOut = $('meshInviteOut') as unknown as HTMLTextAreaElement | null
+      if (inviteOut) inviteOut.value = invite
+      }
+    } catch { /* 忽略损坏的本地配置 */ }
+
+    // 表单任一改动即自动保存：用户不必记得点「保存配置」，刷新也不丢。
+    const autoSaveMesh = (): void => {
+      try {
+        const cfg = collectMeshConfig()
+        localStorage.setItem('cfpilot-mesh-config', JSON.stringify({ ...cfg, peers: meshPeers }))
+        if (meshProfileMode !== 'idle') {
+          const name = ($('meshProfileName')?.value || '').trim()
+          if (name) {
+            meshProfiles[name] = { ...cfg, peers: meshPeers }
+            meshActiveProfile = name
+            localStorage.setItem('cfpilot-mesh-profiles', JSON.stringify(meshProfiles))
+            localStorage.setItem('cfpilot-mesh-active-profile', meshActiveProfile)
+          }
+        }
+      } catch { /* 存储不可用不阻断 */ }
+    }
+    const meshContent = $('meshContent')
+    if (meshContent) {
+      meshContent.addEventListener('input', autoSaveMesh)
+      meshContent.addEventListener('change', autoSaveMesh)
+    }
+
+    const renderMeshProfileSelect = (): void => {
+      const select = $sel('meshProfileSelect') as HTMLSelectElement | null
+      if (!select) return
+      const names = Object.keys(meshProfiles).sort()
+      select.innerHTML =
+        '<option value="">— 未选择网络 —</option>' +
+        names.map((name) => `<option value="${escapeHtml(name)}">${escapeHtml(name)}</option>`).join('')
+      select.value = meshActiveProfile && names.includes(meshActiveProfile) ? meshActiveProfile : ''
+      const edit = $('btnMeshProfileEdit') as HTMLButtonElement | null
+      const del = $('btnMeshProfileDelete') as HTMLButtonElement | null
+      if (edit) edit.disabled = !select.value
+      if (del) del.disabled = !select.value
+    }
+
+    const showMeshConfig = (mode: 'create' | 'edit', name: string): void => {
+      meshProfileMode = mode
+      const card = $('meshConfigCard')
+      const nameWrap = $('meshProfileNameWrap')
+      const nameInput = $('meshProfileName') as HTMLInputElement | null
+      const createBtn = $('btnMeshProfileCreate') as HTMLButtonElement | null
+      if (card) card.hidden = false
+      if (nameWrap) nameWrap.hidden = false
+      if (nameInput) nameInput.value = name
+      if (createBtn) createBtn.textContent = mode === 'create' ? '取消创建' : '创建网络'
+      card?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+    }
+
+    const hideMeshConfig = (): void => {
+      meshProfileMode = 'idle'
+      const card = $('meshConfigCard')
+      const nameWrap = $('meshProfileNameWrap')
+      const createBtn = $('btnMeshProfileCreate') as HTMLButtonElement | null
+      if (card) card.hidden = true
+      if (nameWrap) nameWrap.hidden = true
+      if (createBtn) createBtn.textContent = '创建网络'
+    }
+
+    const persistMeshProfiles = (): void => {
+      try {
+        localStorage.setItem('cfpilot-mesh-profiles', JSON.stringify(meshProfiles))
+        localStorage.setItem('cfpilot-mesh-active-profile', meshActiveProfile)
+      } catch { /* 存储不可用不阻断 */ }
+      renderMeshProfileSelect()
+    }
+
+    $('btnMeshProfileCreate')?.addEventListener('click', () => {
+      if (meshProfileMode === 'create') {
+        const form = $('meshContent')
+        form?.querySelectorAll<HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement>('input,textarea,select').forEach((el) => {
+          if (el instanceof HTMLInputElement && el.type === 'checkbox') {
+            el.checked = el.id === 'meshEnableDegrade' || el.id === 'meshEnablePunch'
+          } else {
+            el.value = ''
+          }
+        })
+        meshPeers = []
+        renderMeshPeers()
+        hideMeshConfig()
+        return
+      }
+      const form = $('meshContent')
+      form?.querySelectorAll<HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement>('input,textarea,select').forEach((el) => {
+        if (el instanceof HTMLInputElement && el.type === 'checkbox') {
+          el.checked = el.id === 'meshEnableDegrade' || el.id === 'meshEnablePunch'
+        } else if (el.id !== 'meshProfileName') {
+          el.value = ''
+        }
+      })
+      meshPeers = []
+      renderMeshPeers()
+      void (async () => {
+        if (!(await meshVariantReady)) return
+        try {
+          const resp = await fetch('/api/mesh/identity', { credentials: 'same-origin' })
+          const data = await resp.json().catch(() => ({}))
+          if (resp.ok && data.nodeId) {
+            const el = $('meshNodeId')
+            if (el) el.value = data.nodeId
+            localStorage.setItem('cfpilot-mesh-node-id', data.nodeId)
+          }
+        } catch { /* 身份读取失败不阻断创建 */ }
+      })()
+      showMeshConfig('create', '')
+    })
+
+    $('btnMeshProfileEdit')?.addEventListener('click', () => {
+      const name = $sel('meshProfileSelect')?.value || ''
+      const saved = meshProfiles[name]
+      if (!name || !saved) { log('请先选择一个网络', 'warn'); return }
+      applyMeshSaved(saved)
+      meshActiveProfile = name
+      persistMeshProfiles()
+      showMeshConfig('edit', name)
+    })
+
+    $('btnMeshProfileDelete')?.addEventListener('click', async () => {
+      const name = $sel('meshProfileSelect')?.value || ''
+      if (!name) { log('请先选择一个网络', 'warn'); return }
+      if (!window.confirm(`删除网络配置“${name}”？本机保存的配置与对端列表会被移除。`)) return
+      delete meshProfiles[name]
+      if (meshActiveProfile === name) meshActiveProfile = ''
+      hideMeshConfig()
+      persistMeshProfiles()
+      if (await meshVariantReady) {
+        try { await fetch('/api/mesh/profiles', { method: 'POST', headers: { 'Content-Type': 'application/json' }, credentials: 'same-origin', body: JSON.stringify({ action: 'delete', name }) }) } catch { /* 服务未启动时仅删本地 */ }
+      }
+      log(`已删除网络配置“${name}”`, 'ok')
+    })
+
+    $('meshProfileSelect')?.addEventListener('change', async () => {
+      const name = $sel('meshProfileSelect')?.value || ''
+      meshActiveProfile = name
+      persistMeshProfiles()
+      if (!name || !(await meshVariantReady)) return
+      try {
+        await fetch('/api/mesh/profiles', { method: 'POST', headers: { 'Content-Type': 'application/json' }, credentials: 'same-origin', body: JSON.stringify({ action: 'select', name }) })
+      } catch { /* 服务未启动时仅存本地 */ }
+    })
+
+    renderMeshProfileSelect()
+    if (meshActiveProfile && meshProfiles[meshActiveProfile]) {
+      applyMeshSaved(meshProfiles[meshActiveProfile])
+    }
+
+    void refreshRelayIpPick()
+
+    // ---- 服务器中继（UDP）部署闭环 ----
+    // 面板生成服务器端安装命令（令牌先在这里生成，服务器 --init 原样复用），
+    // 再把服务器 --init 的输出整段粘回来，自动回填 NodeId / 地址 / 令牌。
+    // 这样「面板里的三项」与「服务器上的实际配置」不可能对不上。
+    $('btnMeshRelayDeployCmd')?.addEventListener('click', () => {
+      const mode = ($sel('meshRelayServerMode')?.value || 'token') === 'blind' ? 'blind' : 'token'
+      const addr = ($('meshRelayServerAddr')?.value || '').trim()
+      try {
+        let token = ($('meshRelayServerToken')?.value || '').trim()
+        if (mode === 'token' && token.length < 8) {
+          token = randomRelayToken()
+          const el = $('meshRelayServerToken')
+          if (el) el.value = token
+        }
+        const script = buildRelayDeployScript({ mode, addr, token })
+        const out = document.getElementById('meshRelayDeployOut') as HTMLTextAreaElement | null
+        if (out) {
+          out.value = script
+          out.hidden = false
+        }
+        log('已生成服务器部署命令：粘到服务器 root shell 执行，再把输出里的 NodeId 粘回「粘贴部署输出回填」', 'ok')
+        autoSaveMesh()
+      } catch (err) {
+        log('生成部署命令失败：' + (err instanceof Error ? err.message : String(err)), 'warn')
+      }
+    })
+
+    $('btnMeshRelayFillFromInit')?.addEventListener('click', () => {
+      const src = (document.getElementById('meshRelayInitOut') as HTMLTextAreaElement | null)?.value || ''
+      const parsed = parseRelayInitOutput(src)
+      if (!parsed.nodeId && !parsed.addr && parsed.token === undefined) {
+        log('没解析到 MOBIHOP_RELAY_NODE_ID=… 行：请把服务器上 --init 的输出整段粘过来', 'warn')
+        return
+      }
+      if (parsed.nodeId) { const el = $('meshRelayServerId'); if (el) el.value = parsed.nodeId }
+      if (parsed.addr) { const el = $('meshRelayServerAddr'); if (el) el.value = parsed.addr }
+      if (parsed.token !== undefined) { const el = $('meshRelayServerToken'); if (el) el.value = parsed.token }
+      log(
+        '已回填中继配置：' +
+          (parsed.nodeId ? ' 节点 ID ' + parsed.nodeId : '') +
+          (parsed.addr ? ' 地址 ' + parsed.addr : '') +
+          (parsed.token !== undefined ? ' 令牌' : '') +
+          '（保存后重新启动组网生效）',
+        'ok'
+      )
+      autoSaveMesh()
+    })
+
+    $sel('meshRelayServerMode')?.addEventListener('change', () => {
+      const blind = ($sel('meshRelayServerMode')?.value || 'token') === 'blind'
+      // 盲中继不带令牌：禁用而不是清空，切回令牌模式时用户填过的值还在。
+      const el = $('meshRelayServerToken')
+      if (el) el.disabled = blind
+      autoSaveMesh()
+    })
+  }
+
+  function collectMeshConfig(): Record<string, unknown> {
+    return {
+      nodeId: ($('meshNodeId')?.value || '').trim(),
+      tunnelPrivate: localStorage.getItem('cfpilot-mesh-tunnel-priv') || '',
+      identitySeed: localStorage.getItem('cfpilot-mesh-identity-seed') || '',
+      // ⚠️ 键必须是 networkName（Go 字段 NetworkName，JSON 解码按字段名忽略大小写匹配）。
+      // 早前写成 network，解码后 NetworkName 为空 —— 网络名被静默忽略，
+      // 不同网络只要 PSK 相同就会互相发现（失去按网络名隔离的意义）。
+      networkName: ($('meshNetwork')?.value || '').trim(),
+      psk: ($('meshPsk')?.value || '').trim(),
+      virtualIp: ($('meshVirtualIp')?.value || '').trim(),
+      listen: ($('meshListen')?.value || '').trim(),
+      tunName: ($('meshTunName')?.value || '').trim(),
+      relayDomain: ($('meshRelayDomain')?.value || '').trim(),
+      relayRoom: '',
+      relayConnectIp: ($('meshRelayConnectIp')?.value || '').trim(),
+      enableDegrade: ($('meshEnableDegrade') as HTMLInputElement | null)?.checked !== false,
+      disablePunch: ($('meshEnablePunch') as HTMLInputElement | null)?.checked === false,
+      // 云监测台上报：*monitor* 键与输入框 id 对应（本地保存后能按命名约定恢复）；
+      // *monitoring* 是交给 Go mesh.Config 的字段名（默认关闭，留空即不上报）。
+      monitorEndpoint: ($('meshMonitorEndpoint')?.value || '').trim(),
+      monitorToken: ($('meshMonitorToken')?.value || '').trim(),
+      monitorInterval: ($('meshMonitorInterval')?.value || '').trim(),
+      monitorAlias: ($('meshMonitorAlias')?.value || '').trim(),
+      monitoringEndpoint: ($('meshMonitorEndpoint')?.value || '').trim(),
+      monitoringToken: ($('meshMonitorToken')?.value || '').trim(),
+      monitoringIntervalMs: Math.max(5, Number($('meshMonitorInterval')?.value || 30)) * 1000,
+      monitoringAlias: ($('meshMonitorAlias')?.value || '').trim(),
+      // 服务器中继（兜底）：三项齐全才启用；Go 字段 RelayServers。
+      relayServerId: ($('meshRelayServerId')?.value || '').trim(),
+      relayServerAddr: ($('meshRelayServerAddr')?.value || '').trim(),
+      relayServerToken: ($('meshRelayServerToken')?.value || '').trim(),
+      relayServerMode: ($sel('meshRelayServerMode')?.value || 'token'),
+      relayServers: (() => {
+        const id = ($('meshRelayServerId')?.value || '').trim()
+        const addr = ($('meshRelayServerAddr')?.value || '').trim()
+        const token = ($('meshRelayServerToken')?.value || '').trim()
+        const blind = ($sel('meshRelayServerMode')?.value || 'token') === 'blind'
+        // 盲中继只需 ID + 地址（令牌留空）：Go 侧 RelayServerConfig.Blind 会让注册改带 room_tag。
+        if (blind) return id && addr ? [{ nodeId: id, addr, blind: true }] : []
+        return id && addr && token ? [{ nodeId: id, addr, token }] : []
+      })(),
+      peers: meshPeers,
+    }
+  }
+
+  const persistMeshPeers = (): void => {
+    try {
+      const cfg = collectMeshConfig()
+      localStorage.setItem('cfpilot-mesh-config', JSON.stringify({ ...cfg, peers: meshPeers }))
+    } catch { /* 存储不可用不阻断 */ }
+  }
+
+  function renderMeshPeers(): void {
+    const el = document.getElementById('peerList')
+    if (!el) return
+    if (meshPeers.length === 0) { el.textContent = '暂无对端'; return }
+    el.innerHTML = meshPeers.map((p, i) =>
+      `<div style="padding:4px 0;border-bottom:1px solid var(--border)">` +
+      `<code>${escapeHtml(p.nodeId)}</code> ${escapeHtml(p.name || '')} ${escapeHtml(p.addr)} ${escapeHtml(p.virtualIp)} ` +
+      `<a href="#" data-peer-del="${i}" style="color:var(--err)">删除</a></div>`
+    ).join('')
+    el.querySelectorAll('[data-peer-del]').forEach((a) => {
+      a.addEventListener('click', (ev) => {
+        ev.preventDefault()
+        const idx = Number((a as HTMLElement).dataset.peerDel)
+        meshPeers.splice(idx, 1)
+        renderMeshPeers()
+        persistMeshPeers()
+      })
+    })
+  }
 
   function bindScanSubtabs(): void {
     const nav = document.getElementById('scanTabs')
@@ -4775,8 +6521,14 @@ import {
       ) as HTMLButtonElement | null
       if (!btn) return
       const raw = btn.dataset.scanTab
-      const next: 'entry' | 'relay' | 'task' =
-        raw === 'relay' ? 'relay' : raw === 'task' ? 'task' : 'entry'
+      const next: 'entry' | 'relay' | 'mesh' | 'task' =
+        raw === 'relay'
+          ? 'relay'
+          : raw === 'mesh'
+            ? 'mesh'
+            : raw === 'task'
+              ? 'task'
+              : 'entry'
       if (next === scanTab) return
       scanTab = next
       for (const b of nav.querySelectorAll('button[data-scan-tab]')) {
@@ -4784,16 +6536,18 @@ import {
       }
       const entryPanel = document.getElementById('scanPanelEntry')
       const relayPanel = document.getElementById('scanPanelRelay')
+      const meshPanel = document.getElementById('scanPanelMesh')
       const taskPanel = document.getElementById('scanPanelTask')
       if (entryPanel) entryPanel.hidden = next !== 'entry'
       if (relayPanel) relayPanel.hidden = next !== 'relay'
+      if (meshPanel) meshPanel.hidden = next !== 'mesh'
       if (taskPanel) taskPanel.hidden = next !== 'task'
 
       // 「① 数据面与候选来源」在**定时任务页签**下隐藏：
       // 定时任务自己会从账号的部署清单取数据面域名与 WS 路径，
       // 让用户在这里填一遍只会误导（填了也不生效）。
       const sourceCard = document.getElementById('sourceCard')
-      if (sourceCard) sourceCard.hidden = next === 'task'
+      if (sourceCard) sourceCard.hidden = next === 'task' || next === 'mesh'
 
       // 入口方向的两张产物卡（结果 / 自适应对照）在反代页签下**收起**：
       // 它们只跟入口优选有关，留在反代页里既占地方又容易看错。
@@ -4802,6 +6556,10 @@ import {
       const adaptiveCard = document.getElementById('adaptiveCard')
       if (entryResult) entryResult.hidden = next !== 'entry'
       if (adaptiveCard) adaptiveCard.hidden = next !== 'entry'
+
+      // 切回入口优选 / 反代优选子页签时，显式重新同步进度条显示
+      if (next === 'entry') syncScanProgressUI()
+      if (next === 'relay') syncRelayProgressUI()
 
       // 定时任务页首次进入时拉一次清单与 IP 池。
       if (next === 'task') void loadScheduledTasks()
@@ -5170,12 +6928,11 @@ import {
           return
         }
 
-        const wrap = document.getElementById('relayProgressWrap')
-        const bar = document.getElementById('relayBar')
-        const progressText = document.getElementById('relayProgressText')
-        if (wrap) wrap.hidden = false
-        if (bar) bar.style.width = '0%'
-        if (progressText) progressText.textContent = '正在启动…'
+        relayProgressState.visible = true
+        relayProgressState.running = true
+        relayProgressState.pct = 0
+        relayProgressState.text = '正在启动…'
+        syncRelayProgressUI()
         const out = document.getElementById('relayOut')
         if (out) out.textContent = '正在体检，请稍候…'
         try {
@@ -5254,18 +7011,20 @@ import {
     })
 
     window.cfpilot.onRelayProgress?.((p) => {
-      const bar = document.getElementById('relayBar')
-      const text = document.getElementById('relayProgressText')
       const pct = p.total > 0 ? Math.round((p.done / p.total) * 100) : 0
-      if (bar) bar.style.width = pct + '%'
-      if (text) text.textContent = '进度 ' + p.done + '/' + p.total + ' · ' + p.ip + (p.ok ? ' ✓' : ' ✗')
+      relayProgressState.visible = true
+      relayProgressState.running = true
+      relayProgressState.pct = pct
+      relayProgressState.text = '进度 ' + p.done + '/' + p.total + ' · ' + p.ip + (p.ok ? ' ✓' : ' ✗')
+      syncRelayProgressUI()
     })
     window.cfpilot.onRelayResult?.((payload) => {
       renderRelayResult(payload)
-      const bar = document.getElementById('relayBar')
-      if (bar) bar.style.width = payload.ok ? '100%' : '0%'
-      const text = document.getElementById('relayProgressText')
-      if (text) text.textContent = payload.ok ? '已完成' : '未完成'
+      relayProgressState.visible = true
+      relayProgressState.running = false
+      relayProgressState.pct = payload.ok ? 100 : 0
+      relayProgressState.text = payload.ok ? '已完成' : '未完成'
+      syncRelayProgressUI()
     })
   }
 
@@ -5472,11 +7231,16 @@ import {
         renderUpdateNotes(result.latest, result.notes)
         return
       }
-      badge.textContent = '有新版 ' + (result.latest ?? '')
+      // 预发布（beta/rc）显著标注，避免用户把测试版误当正式稳定版
+      const preTag = result.prerelease ? '【测试版' + (result.prereleaseLabel ? ' ' + result.prereleaseLabel : '') + '】' : ''
+      badge.textContent = preTag + ' ' + (result.latest ?? '')
       badge.className = 'badge warn'
       // 发现新版 → **自动开始下载到缓存**（用户不需要再点一次下载按钮）；
       // 下载完成（SSE update-done）后「重启并更新应用」按钮才会亮起。
-      hint.textContent = '发现新版本 ' + result.latest + '（当前 ' + result.current + '），正在自动下载…'
+      hint.textContent = '发现' + (result.prerelease ? '测试版' : '新版本') + ' ' + result.latest +
+        '（当前 ' + result.current + '）' +
+        (result.prerelease ? '。这是测试版，可能包含未稳定功能，请确认后再更新；' : '，') +
+        '正在自动下载…'
       ;(document.getElementById('btnUpdate') as HTMLButtonElement).disabled = true
       ;(document.getElementById('btnUpdate') as HTMLButtonElement).textContent = '重启并更新应用'
       renderUpdateNotes(result.latest, result.notes)
@@ -5903,6 +7667,8 @@ import {
       // 最后一条日志映射出的百分比上（常见是「处理中 · 总进度 1%」）——
       // 桌面版跑完优选后进度条一直卡着，就是这里漏了收尾。
       finishScanProgress(entries.length > 0)
+      // 刷新/切页后由 /api/scan/status 恢复出来的扫描在结束后也要解锁按钮
+      if (uiBusy) setBusy(false)
       renderScanResult(payload)
       // 优选成功后端已自动留底 —— 顺手刷新历史列表，
       // 用户不用手动点「刷新」就能看到刚跑完的这批结果。
@@ -6828,6 +8594,9 @@ import {
     safeBind('运行时状态', bindRuntime)
     safeBind('凭据', bindCredentials)
     safeBind('部署', bindDeploy)
+    safeBind('部署页签', bindDeploySubtabs)
+    safeBind('盲中继/云监测台', bindEdge)
+    safeBind('组网', bindMesh)
     safeBind('链式代理', bindChain)
     safeBind('优选', bindScan)
     safeBind('优选页签', bindScanSubtabs)
@@ -6878,6 +8647,8 @@ import {
     })
     // 国家选择器：不 await，避免拖慢界面；加载失败也不影响优选
     void runStep('国家选择器', initCountryControls)
+    // 若后台正在跑优选（如刷新页面、关闭重开窗口或托盘一键优选），启动时自动恢复进度条
+    void runStep('优选进度状态', restoreScanProgressFromServer)
 
     log('CFPilot GUI 已就绪')
     log('凭据只保存在本机，不会上传')
@@ -6894,5 +8665,50 @@ import {
         /* 启动期检测失败不影响其它功能，用户可手点「检测账号」重试 */
       }
     })()
+
+    // 按构建变体显示组网入口：普通版隐藏「组网」页签与 mesh 教程，+mesh 版显示。
+    void (async () => {
+      try {
+        const enabled = await (window.cfpilot.meshEnabled?.() ?? Promise.resolve(false))
+        const navBtn = document.querySelector('#nav button[data-page="mesh"]') as HTMLElement | null
+        if (navBtn) navBtn.hidden = !enabled
+        const notice = document.getElementById('meshNotice')
+        const content = document.getElementById('meshContent')
+        if (notice) notice.hidden = enabled
+        if (content) content.hidden = !enabled
+        const meshTutorial = document.getElementById('tutorialMesh')
+        if (meshTutorial) meshTutorial.hidden = !enabled
+        const fillBtn = $('btnFillMeshConfig')
+        // 「填入组网配置」仅 +mesh 版有意义（普通版部署盲中继也不组网）
+        if (fillBtn && !enabled) fillBtn.hidden = true
+        // 「组网入口」页签同理由：普通版没有 /api/mesh/relay-scan
+        const meshScanTab = document.querySelector(
+          'button[data-scan-tab="mesh"]'
+        ) as HTMLElement | null
+        if (meshScanTab) meshScanTab.hidden = !enabled
+      } catch {
+        /* 端点不可用时（旧版外壳）保守隐藏组网入口 */
+        const navBtn = document.querySelector('#nav button[data-page="mesh"]') as HTMLElement | null
+        if (navBtn) navBtn.hidden = true
+        const meshScanTab = document.querySelector(
+          'button[data-scan-tab="mesh"]'
+        ) as HTMLElement | null
+        if (meshScanTab) meshScanTab.hidden = true
+      }
+    })()
   })
 })()
+
+
+
+
+
+
+
+
+
+
+
+
+
+

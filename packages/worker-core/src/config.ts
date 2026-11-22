@@ -51,56 +51,56 @@ export const DEFAULT_CONFIG: UserConfig = {
   proxyMode: 'only' as ProxyMode,
   nat64: '',
   concurrentDial: true,
-  dataBudgetMB: 0,
+  // 单连接流量熔断（512MB）：数据面不受 CpuBudget 约束，WS/XHTTP 长连接
+  // 在同一 invocation 里持续累积 CPU，Free 版 10ms 上限撞穿就是 1102。
+  // 512MB 对单连接是很大的量（正常浏览/视频不会触及），超限主动断流让
+  // 客户端重连，CPU 随新 invocation 归零。显式设 0 可恢复旧的不限制行为。
+  dataBudgetMB: 512,
   // 出站拨号时序（P1 #11）：此前散落在 4 个调用点的硬编码常量，
   // 统一到这里，经 configFromEnv / mergeConfig 走 KV > env > default 三层。
   dialConnectMs: 5000,
   dialBudgetMs: 15_000,
   dohBudgetMs: 1200,
   dialStallMs: 2500,
-  relayRedialMax: 4,
+  // 假活换入口上限 4→2：每轮重拨都是一次完整 dial（DoH + 6 路 TCP/TLS），
+  // 是数据面 CPU 的最大放大器。配合 pinnedHosts 固定反代入口已能覆盖
+  // 已知假活目标；保留 2 轮作为兜底，避免 4 轮累积 10~18s 的 CPU 开销。
+  relayRedialMax: 2,
   resolvePreferred: true,
   // 默认保守：只修「直连假活」，不替用户在代理出口上擅自换路
   aggressiveRedial: false,
-  // 出厂反代入口池（2026-11-15）：
-  // 不同反代入口转发同一个 CF 网段站点，目标站点（如 X 的 api.x.com）
-  // 在 Cloudflare 上的 WAF 会按「请求到达边缘时的源」区别对待 ——
-  // 实测部分入口的出口会被 X 拦截（403 body=「IPv6」），部分直达后端。
-  // 这 7 个是逐个实测确认「POST api.x.com/graphql 能到达 X 后端」的入口，
-  // 与用户配置的 relayPool **按行合并**（用户条目优先，出厂条目补充）。
-  relayPool: '155.248.181.189\n64.181.255.215\n23.144.20.184\n137.184.228.85\n159.60.146.82\n216.195.213.76\n107.174.42.185\n216.36.82.11\n216.195.213.107\n216.167.16.112\n216.195.213.132\n23.144.4.243\n38.244.150.113\n151.244.201.207\n194.87.62.139\n192.18.136.255',
-  // 出厂固定落地 / 固定反代入口（2026-11-14）：
-  // x.com 的权威 DNS 把流量分散到多家 CDN，直连随 DNS 漂移时好时坏；
-  // cloudflare.com 在 CF 网段，直连必被 TCP Loop 拒绝，只能固定反代入口。
-  // 这两条是**出厂修复**，与用户在面板配置的 pinnedHosts **按域名合并**
-  // （用户条目优先，见 mergeConfig 的 pinnedHosts 分支）——
-  // 用户只为 jable.tv 等其他站点写映射时，这两条依然生效。
+  // 出厂反代入口池（2026-11-21 真机双通复核）：
+  // 全部条目均经实测确认「cloudflare.com 200 且 api.x.com / x.com 直达 X 后端、无 403 拦截」，
+  // 已剔除全部老化（超时 / TLS Fatal Alert 40/80）与被 X WAF 拦截（403 IPv6）的旧入口。
+  // 与用户配置的 relayPool **按行合并**（用户条目优先，出厂条目补充）；运行期另有
+  // 低频动态清单（data/relay-ips.txt）在内存中自动保活补充。
+  relayPool: '216.36.82.11\n137.184.228.85\n216.167.16.112\n128.121.31.252\n23.144.20.184\n38.84.201.228\n155.248.181.189\n38.244.150.113\n64.181.255.215',
+  // 出厂**不再内置**任何固定落地 / 固定反代入口（2026-11-19）。
   //
-  // `*.x.com` 通配（2026-11-15）：X 的**手机 app** 走的是子域
-  // （api.x.com / upload.x.com 等），不是 x.com 本身 —— 只固定裸域时
-  // 「电脑网页能开、手机 app 打不开」。实测 Fastly 落地对全部 x.com
-  // 子域都服务（api 404 / upload 410 都是完整 TLS+HTTP 往返），
-  // 且比默认链路快 3 倍。通配与裸域是两条独立条目（通配不匹配裸域）。
+  // 早前这里写死了 5 条，其中 3 条是手机 app 的 `r:` 通配
+  // （`*.x.com` / `*.twitter.com` / `*.twimg.com` = r:155.248.181.189）。
+  // 把它们做成出厂默认有两个致命问题：
+  //   1. **全用户共享单点**：IP 一失效，所有部署同时受影响，只能等发新版；
+  //      而客户端 app 的网络超时约 10~15s，每次请求先白等一次 pin 超时
+  //      就足以表现为「一直转圈 / 打不开」。
+  //   2. **其中至少一条本来就不成立**：`pbs.twimg.com` 解析到 Fastly
+  //      （146.75.x），而 `r:` 是把 TLS 按 SNI 转给 **Cloudflare**，
+  //      CF 无法服务 Fastly 承载的域名 —— 这条 pin 无论如何都不会生效。
   //
-  // ⚠️ 下面 3 条 `r:` 通配（2026-11-15 二次修复，真正解决手机 app 打不开）：
-  // 手机 app 的 API / 图片域名（api.x.com、api.twitter.com、pbs.twimg.com
-  // 等）解析到 Cloudflare 网段 → 直连被 TCP Loop 拒绝 → 触发假活检测 +
-  // 反代重拨竞速（DOWNLINK_STALL_MS 2.5s × 最多 4 次），实测首请求
-  // 累积 10~18 秒，超过 app 的网络超时（约 10~15s），表现为一直转圈
-  // 加载不出内容 —— **不是被 WAF 拦，是被拖超时了**。
-  // `r:` 固定反代入口让这些域名第一条路径就直接按 SNI 转发，跳过整套
-  // 竞速；实测稳定延迟从 5~18s 降到 1~3s。固定入口失败时 dial 层会自动
-  // 回落到普通反代池，不会完全断。
-  // 注意这与「固定落地 IP 通配」完全不同：`r:` 是按 SNI 转发到 CF 边缘，
-  // API 服务能正确路由；固定落地 IP 会把 app 请求发给不服务 API 的 Fastly。
-  pinnedHosts: 'x.com=151.101.194.146\n*.x.com=r:155.248.181.189\n*.twitter.com=r:155.248.181.189\n*.twimg.com=r:155.248.181.189\ncloudflare.com=r:45.76.246.192',
+  // 现在改为**建议值**（见 SUGGESTED_PINNED_HOSTS）：默认不生效，
+  // 面板里作为可选推荐展示，用户确认后才写入。这样失效只影响
+  // 「自己填了这条」的用户，且随时可删。
+  //
+  // 另外，pin 现在已纳入熔断（dial.ts）：即使填了失效的 pin，
+  // 连续失败 2 次后进入冷却、直接走池，冷却到期自动半开重试。
+  pinnedHosts: '',
   useBuiltinRelay: true,
   enableTrojan: true,
   enableXhttp: true,
   subDomain: '',
   subProtocol: 'vless',
   subTransport: 'ws',
-  subVariants: 'vless-ws',
+  subVariants: 'vless-ws,vless-xhttp',
   subName: 'CFPilot',
   subPorts: '443',
   clientFingerprint: 'chrome',
@@ -275,7 +275,41 @@ function mergeLineList(fallback: string, user: string): string {
  *
  * 行文本原样保留（含逗号分隔多 IP 的写法），不重新格式化。
  */
+// 已移除的出厂固定值（IP 失效会导致被 pin 域名完全断掉，2026-11-19）。
+// 旧用户的 KV 里可能仍存着它们，读取时主动剔除，避免继续 pin 到失效 IP。
+const STALE_FACTORY_PINS = new Set([
+  // 2026-11-19 起出厂不再 pin 任何入口；下列是历史出厂值，
+  // 旧用户 KV 里可能仍残留（面板保存时写入过合并值），读取时统一剔除。
+  'x.com=151.101.194.146',
+  'cloudflare.com=r:45.76.246.192',
+  '*.x.com=r:155.248.181.189',
+  '*.twitter.com=r:155.248.181.189',
+  '*.twimg.com=r:155.248.181.189',
+])
+
+/**
+ * 建议值（**默认不生效**）：面板里作为可选推荐展示，用户确认后才写入。
+ *
+ * 为什么不做出厂默认：固定入口是单点，IP 失效即全网受影响，且客户端
+ * 每次请求都要先等一次 pin 超时（表现为 app 一直转圈）。
+ * 实测（2026-11-19）：`pbs.twimg.com` 解析到 Fastly，而 `r:` 只能把 TLS
+ * 按 SNI 转给 Cloudflare，这条对 twimg 的建议本身不成立，只适合
+ * **CF 承载**的域名（如 api.x.com）。
+ */
+export const SUGGESTED_PINNED_HOSTS =
+  '*.x.com=r:155.248.181.189\n*.twitter.com=r:155.248.181.189'
+
+function dropStaleFactoryPins(text: string): string {
+  return String(text ?? '')
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter((l) => l && !STALE_FACTORY_PINS.has(l))
+    .join('\n')
+}
+
 function mergePinnedHosts(fallback: string, user: string): string {
+  // ⚠️ 这里**不做**历史出厂值剔除：剔除放在 loadConfig 的一次性迁移里。
+  // 否则用户永远无法把「建议值」重新填回来（会被当成残留删掉）。
   const userText = String(user ?? '').trim()
   if (!userText) return String(fallback ?? '')
   const fallbackText = String(fallback ?? '').trim()
@@ -392,6 +426,18 @@ export async function loadConfig(store: Store, env: Env): Promise<UserConfig> {
   const config = mergeConfig(fromEnv, stored)
 
   let dirty = false
+  // 一次性迁移：旧版本会把出厂固定入口**合并进用户 KV**（面板保存过就会写入），
+  // 而出厂已不再 pin 任何入口。这里把残留的历史出厂值清掉并写回一次；
+  // 之后用户手动填同样条目不会再被删（merge 层已不做剔除）。
+  // 只在值真的变化时才写入，避免无谓的 KV 写配额消耗。
+  if (raw && typeof stored.pinnedHosts === 'string') {
+    const migrated = dropStaleFactoryPins(stored.pinnedHosts)
+    if (migrated !== stored.pinnedHosts.trim()) {
+      stored = { ...stored, pinnedHosts: migrated }
+      config.pinnedHosts = migrated
+      dirty = true
+    }
+  }
   // ⚠️ 只有**持久化存储（KV）**才允许自动生成凭据并写回：
   // 生产上未绑定 KV 时 `createStore` 每个请求都 `new MemoryStore()`，
   // 「生成并写回」等于每个请求/每个隔离体都得到不同的随机 UUID ——
@@ -594,3 +640,5 @@ export async function saveDomainLibrary(store: Store, domains: string[]): Promis
   }
   await store.put(POOL_DOMAIN_KEY, cleaned.join('\n'))
 }
+
+

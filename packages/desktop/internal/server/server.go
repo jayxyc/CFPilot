@@ -91,6 +91,8 @@ type Server struct {
 	scan scanState
 	// relay 是反代体检任务状态（同一时刻只允许一个）
 	relay relayState
+	// edge 是盲中继部署任务状态（与代理部署独立，互不阻塞）
+	edge edgeState
 	// update 是更新下载状态
 	update updateState
 	// cfBase 覆盖 Cloudflare API 根地址（测试用；生产恒为空 → 走官方地址）
@@ -405,6 +407,15 @@ func (s *Server) routes() http.Handler {
 
 	// 优选 / 环境检测 API
 	s.registerScanRoutes(mux)
+
+	// 盲中继 / 云监测台部署 API（基础功能，独立资源，不碰代理内核）
+	s.registerEdgeRoutes(mux)
+
+	// 构建变体查询（普通版 / +mesh 版）：界面据此显示或隐藏组网入口
+	mux.HandleFunc("/api/mesh/enabled", s.guard(s.handleMeshEnabled))
+
+	// +mesh 控制 API（start/stop/status/peers）：面板与托盘通过它控制提权守护进程 meshd
+	s.registerMeshControlRoutes(mux)
 
 	// 定时优选任务 API（任务清单 + 本地 IP 池）
 	// 安卓上没有这个功能（见 allowScheduledTasks），路由也不注册。
@@ -804,6 +815,11 @@ func (s *Server) handleServiceStatus(w http.ResponseWriter, r *http.Request) {
 		"pid": osGetpid(),
 		// 程序版本（界面「运行状态」要显示**真实版本**，不能只写「运行中」）。
 		"version": Version(),
+		// 构建变体：两个产物共用同一个版本号，界面靠它区分普通版与 +mesh 版。
+		"variant": variantName(),
+		// 内嵌界面指纹：同版本号可能重编多次，这里给面板一个可自证的构建标记，
+		// 避免「装了新包但界面没变」时无法判断到底跑的是哪一份 renderer.js。
+		"uiBuild": embeddedUIBuild(),
 	})
 }
 

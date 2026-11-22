@@ -32,6 +32,18 @@ interface CFPilotCapabilities {
 // 本文件不是模块（没有 import/export），所以直接声明全局接口即可。
 interface Window {
   __cfpilotCaps?: CFPilotCapabilities
+  /**
+   * 应用窗口注入的壳桥（只有桌面版的窗口形态才有）。
+   *
+   * 浏览器 / 容器 / 安卓上不存在，因此使用前必须判空。
+   */
+  __cfpilotShell?: {
+    host: 'window'
+    platform: string
+    /** custom = 无边框窗口，标题栏由面板绘制；native = 用系统标题栏 */
+    chrome: 'custom' | 'native'
+    send(cmd: 'min' | 'max' | 'close' | 'drag' | 'open-external', url?: string): void
+  }
 }
 
 /** 渲染层的 window.cfpilot（由 preload 通过 contextBridge 注入） */
@@ -149,12 +161,66 @@ interface QuickScanResult {
   error?: string
 }
 
+/** 一个已部署的盲中继 / 云监测台实例（Go internal/edge.Instance，与 CLI 同源） */
+interface CFPilotEdgeRelayInstance {
+  workerName: string
+  /** 自定义域名；未绑定为空串 */
+  domain: string
+  workerUrl: string
+  wssEndpoint: string
+  zoneId: string
+  zoneName: string
+  dashboardProject: string
+  dashboardUrl: string
+  dashboardReady: boolean
+  d1Name: string
+  d1Uuid: string
+  doClass: string
+  /** 上报令牌（secret 存储时为空串，需看 warnings） */
+  monitorToken: string
+  limits: {
+    windowMs: string
+    maxBytes: string
+    maxPackets: string
+    maxPeers: string
+  }
+  reachable: boolean
+  passwordSet: boolean
+  warnings: string[]
+}
+
+/** 「检测部署状态」的结果（只读探测，不含密码） */
+interface CFPilotEdgeCheckResult {
+  ok: boolean
+  error?: string
+  accountId?: string
+  /** 检测时正好有部署在跑（只作提示，不阻断） */
+  deployInProgress?: boolean
+  instances: CFPilotEdgeRelayInstance[]
+  warnings: string[]
+}
+
 interface Window {
   cfpilot: {
+    /** 当前构建是否启用 +mesh 组网变体（普通版 false，+mesh 版 true） */
+    meshEnabled(): Promise<boolean>
+    /** 命名网络档案：创建 / 修改 / 删除 / 选择后由服务持久化，并在服务重启后自动恢复当前网络 */
+    meshProfiles(): Promise<{
+      version?: number
+      selected?: string
+      autoStart?: boolean
+      profiles?: Array<{ name: string; config: Record<string, unknown> }>
+    }>
+    meshProfileSave(name: string, config: Record<string, unknown>): Promise<Record<string, unknown>>
+    meshProfileSelect(name: string): Promise<Record<string, unknown>>
+    meshProfileDelete(name: string): Promise<Record<string, unknown>>
     /** 列出所有账户配置（不含 Token 明文） */
     listProfiles(): Promise<CFPilotProfileView[]>
-    /** 新建账户配置并激活 */
-    createProfile(name?: string): Promise<CFPilotProfileView>
+    /** 新建账户配置并激活（可一次携带 cfToken，避免空凭据窗口） */
+    createProfile(
+      name?: string,
+      init?: { cfToken?: string; accountId?: string }
+    ): Promise<CFPilotProfileView>
     /** 更新账户配置 */
     updateProfile(
       id: string,
@@ -173,6 +239,44 @@ interface Window {
     switchProfile(id: string): Promise<{ ok: boolean; activeId: string }>
     /** 当前激活账户 */
     currentProfile(): Promise<CFPilotProfileView | null>
+
+    /** 盲中继 / 云监测台部署结果（Go internal/edge.Result，与 CLI 同源） */
+    deployEdgeRelay(params: {
+      domain: string
+      workerName?: string
+      monitorPassword: string
+      monitorToken?: string
+      dashboardProject?: string
+      withDashboard?: boolean
+      zoneId?: string
+      /** 绑定前自动创建 DNS 占位记录（已代理 AAAA 100::），默认 true */
+      autoDns?: boolean
+      windowMs?: string
+      maxBytes?: string
+      maxPackets?: string
+      maxPeers?: string
+    }): Promise<{
+      ok?: boolean
+      error?: string
+      workerName?: string
+      workerUrl?: string
+      wssEndpoint?: string
+      d1Name?: string
+      d1Uuid?: string
+      doClass?: string
+      dashboardUrl?: string | null
+      monitorToken?: string
+      monitorPassword?: string
+    }>
+    /** 列出当前账号的 Cloudflare zone（供盲中继域名下拉） */
+    listEdgeZones(): Promise<{ zones: Array<{ id: string; name: string }> }>
+    /**
+     * 检测账号下已部署的盲中继 / 云监测台实例（只读）。
+     *
+     * 与「检查部署状态」同一条纪律：只读探测，**永不部署**、不写 KV / DNS。
+     * 浏览器 / 容器 / 安卓外壳没有这个方法，界面必须 feature-detect。
+     */
+    checkEdgeDeployment?(): Promise<CFPilotEdgeCheckResult>
 
     runDeploy(
       params: {
@@ -626,7 +730,38 @@ interface Window {
      * 后端打开的是传入文件**所在目录**，所以传日志文件本身即可。
      */
     revealFile(file: string): Promise<{ ok: boolean; path?: string; error?: string }>
-    detectAccount(): Promise<{ accountId: string; accountName: string }>
+    detectAccount(profileId?: string): Promise<{
+      accountId: string
+      accountName: string
+      accounts?: Array<{ id: string; name: string }>
+    }>
+    /** 查询当前或最近一次入口优选进度（切页 / 刷新后恢复进度条） */
+    scanStatus?(): Promise<{
+      running: boolean
+      hasState: boolean
+      host?: string
+      pct: number
+      stage: string
+      text: string
+      done?: number
+      total?: number
+      message?: string
+      finished: boolean
+      ok: boolean
+    }>
+    /** 查询当前或最近一次反代优选进度（切页 / 刷新后恢复进度条） */
+    relayStatus?(): Promise<{
+      running: boolean
+      hasState: boolean
+      done: number
+      total: number
+      ip?: string
+      ok?: boolean
+      pct: number
+      text: string
+      finished: boolean
+      resultOk: boolean
+    }>
     /**
      * 链式代理：把内嵌的部署脚本取回来（原文 + 手动执行的命令）。
      *
@@ -681,6 +816,10 @@ interface Window {
       pid: number
       /** 本程序版本号（如 0.13.6），用于「运行状态」展示真实版本 */
       version?: string
+      /** 构建变体：standard（普通版）/ mesh（+mesh 组网版） */
+      variant?: string
+      /** 内嵌界面资源指纹，用来确认当前运行的是哪一次 UI 构建 */
+      uiBuild?: string
       /**
        * 数据目录（设置、凭据、日志都在这里）。
        *
@@ -749,6 +888,17 @@ interface Window {
     wipeCredentials(): Promise<{ wiped: boolean }>
     credentialsState(): Promise<{ hasToken: boolean; accountId: string; kvNamespaceId: string }>
     openExternal(url: string): Promise<void>
+    /**
+     * 窗口控制（可选能力）。
+     *
+     * 只有应用窗口里 available 才为 true；浏览器 / 容器 / 安卓上是 no-op。
+     */
+    windowApi?: {
+      available: boolean
+      minimize(): void
+      maximize(): void
+      close(): void
+    }
     onLog(cb: (entry: CFPilotLogEntry) => void): () => void
     onDeployStatus(cb: (status: CFPilotDeployStatus) => void): () => void
     onScanResult(cb: (payload: CFPilotScanResult) => void): () => void
@@ -842,6 +992,10 @@ interface Window {
       current: string
       latest: string | null
       hasUpdate: boolean
+      /** true = 新版本是预发布（beta/rc），界面需标注「测试版」避免误导 */
+      prerelease?: boolean
+      /** 预发布标识（如 "beta.1"），空/缺省表示正式版 */
+      prereleaseLabel?: string
       downloadUrl: string | null
       notes: string
       error?: string
@@ -1350,3 +1504,4 @@ interface SourcesListResult {
 }
 
 type ExternalSourceType = 'github-raw' | 'custom-url' | 'ripe-stat'
+

@@ -149,8 +149,9 @@
     const opts = {
       method: method,
       headers: { 'Content-Type': 'application/json' },
-      // 带上 Cookie（会话鉴权靠它）
+      // 带上 Cookie（会话鉴权靠它），并显式禁缓存避免移动 WebView 读到旧账户列表
       credentials: 'same-origin',
+      cache: 'no-store',
     }
     if (body !== undefined) opts.body = JSON.stringify(body)
 
@@ -203,9 +204,9 @@
   /**
    * 各事件的订阅者列表。
    *
-   * ⚠️ 这里必须与后端 `s.events.publish(...)` 的**全部 8 个事件**一一对应：
+   * ⚠️ 这里必须与后端 `s.events.publish(...)` 的**全部 9 个事件**一一对应：
    * deploy-status / log / relay-progress / relay-result / scan-result /
-   * task-status / update-done / update-progress。
+   * task-status / update-done / update-progress / edge-result。
    *
    * 漏一个键的后果（2026-11-05 真机）：relay-result / relay-progress 没声明，
    * 界面启动调 onRelayResult / onRelayProgress 时 subscribe() 里的
@@ -225,6 +226,7 @@
     'update-progress': [],
     'update-done': [],
     'task-status': [],
+    'edge-result': [],
   }
 
   let es = null
@@ -362,6 +364,12 @@
   }
 
   const api = {
+    /* ---------------- 构建变体 ---------------- */
+
+    meshEnabled: function () {
+      return get('/api/mesh/enabled').then(function (r) { return !!(r && r.enabled) })
+    },
+
     /* ---------------- 部署 ---------------- */
 
     runDeploy: function (params, kvNamespaceId) {
@@ -438,8 +446,13 @@
       })
     },
 
-    createProfile: function (name) {
-      return post('/api/profile/create', { name: name || '' }).then(function (r) {
+    createProfile: function (name, init) {
+      var body = { name: name || '' }
+      if (init && typeof init === 'object') {
+        if (typeof init.cfToken === 'string') body.cfToken = init.cfToken
+        if (typeof init.accountId === 'string') body.accountId = init.accountId
+      }
+      return post('/api/profile/create', body).then(function (r) {
         var p = (r && r.profile) || null
         if (!p) throw new Error('新建账户失败：后端没有返回账户信息')
         // 与 listProfiles 保持一致：新建的账户即为激活项
@@ -477,8 +490,9 @@
 
     /* ---------------- 账号与 KV ---------------- */
 
-    detectAccount: function () {
-      return post('/api/account/detect')
+    detectAccount: function (profileId) {
+      var body = profileId ? { profileId: profileId } : {}
+      return post('/api/account/detect', body)
     },
 
     // 链式代理：取内嵌脚本（原文 + 手动执行命令）
@@ -559,6 +573,67 @@
           reject(err)
         })
       })
+    },
+
+    scanStatus: function () {
+      return get('/api/scan/status')
+    },
+
+    relayStatus: function () {
+      return get('/api/relay/status')
+    },
+
+    /* ---------------- 盲中继 / 云监测台 ---------------- */
+
+    /**
+     * 部署盲中继 + 云监测台。语义与 runScan 一致：等 edge-result 事件再 resolve。
+     * 与 CLI `cfpilot edge deploy` 同源（Go internal/edge.Deploy）。
+     */
+    deployEdgeRelay: function (params) {
+      return new Promise(function (resolve, reject) {
+        let settled = false
+        const unsub = subscribe('edge-result', function (payload) {
+          if (settled) return
+          settled = true
+          unsub()
+          clearTimeout(timer)
+          if (payload && payload.ok === false) {
+            reject(new Error((payload && payload.error) || '盲中继部署失败'))
+          } else {
+            resolve(payload && payload.result ? payload.result : payload)
+          }
+        })
+        const timer = setTimeout(function () {
+          if (settled) return
+          settled = true
+          unsub()
+          reject(new Error('盲中继部署超时（超过 10 分钟未返回结果）'))
+        }, 10 * 60 * 1000)
+        post('/api/edge/deploy', params || {}).catch(function (err) {
+          if (settled) return
+          settled = true
+          unsub()
+          clearTimeout(timer)
+          reject(err)
+        })
+      })
+    },
+
+    /** 列出账号下的 zone，供域名下拉选择 */
+    listEdgeZones: function () {
+      return get('/api/edge/zones').then(function (r) {
+        return { zones: (r && r.zones) || [] }
+      })
+    },
+
+    /**
+     * 检测账号下已部署的盲中继 / 云监测台实例（只读）。
+     *
+     * 返回结构见 globals.d.ts 的 checkEdgeDeployment 声明；
+     * 后端 /api/edge/check 只发 GET，绝不部署、不写任何资源。
+     */
+    checkEdgeDeployment: function () {
+      return get('/api/edge/check')
     },
 
     detectScanHost: function () {
@@ -1159,6 +1234,24 @@
       return get('/api/service/status')
     },
 
+    /* ---------------- 组网：命名网络档案 ---------------- */
+
+    meshProfiles: function () {
+      return get('/api/mesh/profiles')
+    },
+
+    meshProfileSave: function (name, config) {
+      return post('/api/mesh/profiles', { action: 'save', name: name, config: config })
+    },
+
+    meshProfileSelect: function (name) {
+      return post('/api/mesh/profiles', { action: 'select', name: name })
+    },
+
+    meshProfileDelete: function (name) {
+      return post('/api/mesh/profiles', { action: 'delete', name: name })
+    },
+
     /** 纯本地的部署信息（内置内核 + 最近一次部署留档），不联网、不用 Token。 */
     getLocalDeployInfo: function () {
       return get('/api/deploy/local')
@@ -1173,8 +1266,28 @@
     openExternal: function (url) {
       // 只放行 https，避免被构造出 javascript: / file: 等协议
       if (!/^https:\/\//i.test(url)) return Promise.resolve()
+      // 应用窗口内没有地址栏也没有标签页：新开窗口会变成孤儿窗口，
+      // 统一交给系统浏览器打开。浏览器形态（容器 / 局域网 / 安卓）没有桥，走原来的 window.open。
+      var sh = window.__cfpilotShell
+      if (sh && typeof sh.send === 'function') {
+        sh.send('open-external', url)
+        return Promise.resolve()
+      }
       window.open(url, '_blank', 'noopener,noreferrer')
       return Promise.resolve()
+    },
+
+    /**
+     * 窗口控制（可选能力）。
+     *
+     * 只在应用窗口里存在；浏览器 / 容器 / 安卓上拿到的是一组 no-op，
+     * 界面不需要额外判断宿主。
+     */
+    windowApi: {
+      available: false,
+      minimize: function () {},
+      maximize: function () {},
+      close: function () {},
     },
 
     /* ---------------- 事件订阅 ---------------- */
@@ -1272,6 +1385,97 @@
     applyFlatHeader()
   }
 
+  /* ------------------------------------------------------------------ */
+  /* 应用窗口的无边框标题栏                                               */
+  /* ------------------------------------------------------------------ */
+
+  /**
+   * 只有「自绘标题栏」的窗口（当前是 Windows）才装标题栏。
+   *
+   * 判据来自壳注入的 window.__cfpilotShell.chrome：
+   *   - custom：无边框窗口，标题栏、拖动、窗口按钮都由本文件提供；
+   *   - native：窗口管理器已经画了标题栏（Linux），这里什么都不做，
+   *     否则会出现两层标题栏。
+   *
+   * 浏览器 / 容器 / 安卓没有 __cfpilotShell，整段直接跳过 ——
+   * packages/ui 因此保持「外壳无关」。
+   */
+  function installWindowChrome() {
+    var sh = window.__cfpilotShell
+    if (!sh || sh.chrome !== 'custom') return
+    if (!document.body || document.getElementById('cfpilot-titlebar')) return
+
+    var style = document.createElement('style')
+    style.id = 'cfpilot-titlebar-style'
+    style.textContent =
+      // body 变成纵向 flex：标题栏固定高度，.app 占剩下的空间。
+      // 面板原本用 height:100%，这里必须显式改成弹性，否则标题栏会把内容顶出视口。
+      'body{display:flex;flex-direction:column;height:100%}' +
+      'body>.app{flex:1 1 auto;min-height:0;height:auto}' +
+      '#cfpilot-titlebar{flex:0 0 auto;height:34px;display:flex;align-items:center;gap:10px;' +
+      'padding-left:12px;background:var(--bg-nav);border-bottom:1px solid var(--border);' +
+      'user-select:none;-webkit-user-select:none;cursor:default}' +
+      '#cfpilot-titlebar .tb-brand{display:flex;align-items:center;gap:8px;font-size:12.5px;' +
+      'font-weight:600;color:var(--text-secondary);letter-spacing:.02em}' +
+      '#cfpilot-titlebar .tb-logo{width:18px;height:18px;border-radius:5px;display:flex;' +
+      'align-items:center;justify-content:center;font-size:9.5px;font-weight:700;color:#fff;' +
+      'background:linear-gradient(135deg,#4f7cff,#8b5cf6)}' +
+      '#cfpilot-titlebar .tb-spacer{flex:1 1 auto}' +
+      '#cfpilot-titlebar .tb-actions{display:flex;align-items:center;height:100%}' +
+      '#cfpilot-titlebar .tb-actions button{width:44px;height:34px;border:0;background:transparent;' +
+      'color:var(--text-secondary);font-size:13px;line-height:1;cursor:default;' +
+      'display:flex;align-items:center;justify-content:center}' +
+      '#cfpilot-titlebar .tb-actions button:hover{background:var(--bg-hover);color:var(--text-main)}' +
+      '#cfpilot-titlebar .tb-actions button.tb-close:hover{background:#e81123;color:#fff}'
+    document.head.appendChild(style)
+
+    var bar = document.createElement('div')
+    bar.id = 'cfpilot-titlebar'
+    bar.innerHTML =
+      '<div class="tb-brand"><span class="tb-logo">CP</span><span class="tb-name">CFPilot</span></div>' +
+      '<div class="tb-spacer"></div>' +
+      '<div class="tb-actions">' +
+      '<button type="button" data-win="min" title="最小化" aria-label="最小化">&#x2013;</button>' +
+      '<button type="button" data-win="max" title="最大化" aria-label="最大化">&#x25A1;</button>' +
+      '<button type="button" class="tb-close" data-win="close" title="关闭" aria-label="关闭">&#x2715;</button>' +
+      '</div>'
+    document.body.insertBefore(bar, document.body.firstChild)
+
+    // 拖动：不经 CSS app-region（WebView2 会把浮层也继承成拖动区），
+    // 交给壳去发 WM_NCLBUTTONDOWN(HTCAPTION)，系统负责移动 / 贴靠。
+    bar.addEventListener('mousedown', function (e) {
+      if (e.button !== 0) return
+      if (e.target && e.target.closest && e.target.closest('button')) return
+      sh.send('drag')
+    })
+    // 双击标题栏 = 最大化 / 还原
+    bar.addEventListener('dblclick', function (e) {
+      if (e.target && e.target.closest && e.target.closest('button')) return
+      sh.send('max')
+    })
+    bar.addEventListener('click', function (e) {
+      var btn = e.target && e.target.closest ? e.target.closest('button[data-win]') : null
+      if (!btn) return
+      var action = btn.getAttribute('data-win')
+      if (action === 'min') sh.send('min')
+      else if (action === 'max') sh.send('max')
+      else if (action === 'close') sh.send('close')
+    })
+
+    if (api && api.windowApi) {
+      api.windowApi.available = true
+      api.windowApi.minimize = function () { sh.send('min') }
+      api.windowApi.maximize = function () { sh.send('max') }
+      api.windowApi.close = function () { sh.send('close') }
+    }
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', installWindowChrome)
+  } else {
+    installWindowChrome()
+  }
+
   // 建立 SSE 连接（失败不影响 API 可用性）
   try {
     ensureStream()
@@ -1285,6 +1489,12 @@
       .serviceStatus()
       .then(function (st) {
         if (st && st.version) api.appVersion = st.version
+        // +mesh 版：自绘标题栏的品牌要能一眼区分产物。
+        // 页面横幅文案两版一致（见 packages/ui），只有这里与系统窗口标题带 +mesh。
+        if (st && st.variant === 'mesh') {
+          var brand = document.querySelector('#cfpilot-titlebar .tb-name')
+          if (brand) brand.textContent = 'CFPilot +mesh'
+        }
       })
       .catch(function () {
         /* 取不到就保持 unknown，不阻断界面 */
